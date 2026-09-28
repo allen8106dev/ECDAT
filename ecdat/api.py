@@ -24,7 +24,7 @@ from scanner import Scanner
 from risk_engine import assess_findings, normalize_profile
 
 app = FastAPI(title='ECDAT Unified Scanner', version='2.0.0')
-app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'], allow_methods=['GET', 'POST'], allow_headers=['Content-Type'])
+app.add_middleware(CORSMiddleware, allow_origins=["https://ecdat-dusky.vercel.app",'http://localhost:5173', 'http://127.0.0.1:5173'], allow_methods=['GET', 'POST'], allow_headers=['Content-Type'])
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get('ECDAT_DATA_DIR', str(ROOT / 'scan-data')))
 DATA.mkdir(parents=True, exist_ok=True)
