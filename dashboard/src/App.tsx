@@ -1,449 +1,226 @@
-import { useState, useEffect, useCallback, type ReactNode } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { ShieldCheck, UploadCloud, GitBranch, Search, Download, FileCode2, Box, Binary, LoaderCircle, ArrowRight, AlertTriangle } from 'lucide-react'
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+import { droppedFiles, prepareUpload, selectedFiles } from './uploads'
+import type { UploadEntry } from './uploads'
 
-interface Occurrence {
-  location: string
-  line?: number
+const API = import.meta.env.VITE_API_URL || '/api'
+type Stats = { files_scanned?: number; files_skipped?: number; archives_opened?: number; text_files?: number; binary_files?: number; duration_seconds?: number }
+type Job = { id: string; source: string; status: string; stats: Stats; error?: string }
+type RawFinding = { file: string; line: number | null; offset: number | null; pattern: string; evidence: string; kind: string; severity: string; confidence: string; recommendation: string }
+type RiskAssessment = { at_risk_now: boolean; urgency_score: number | null; risk_score: number }
+type RiskProfile = { data_lifetime_years: number; migration_time_years: number; criticality: number; crqc_arrival_years: number }
+type Finding = RawFinding & { classification?: string; quantum_vulnerable?: boolean; riskAssessment?: RiskAssessment; cryptoAgilityScore?: number; metadata?: Record<string, unknown> }
+type RiskSummary = { assets_assessed: number; quantum_vulnerable_assets: number; at_risk_now: number; average_crypto_agility_score: number | null }
+type Report = { id: string; source: string; findings: Finding[]; stats: Stats; warnings: string[]; partial: boolean; cbom: unknown; profile: RiskProfile; risk_summary?: RiskSummary; audit_block_hash?: string; audit_error?: string }
+async function jsonResponse(response: Response) {
+  const data = await response.json().catch(() => { throw new Error(`Scanner returned an invalid response (HTTP ${response.status}). Check the API connection.`) })
+  if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail))
+  return data
 }
-
-interface Evidence {
-  occurrences: Occurrence[]
+async function requestJson(path: string, options: RequestInit = {}) {
+  const timeout = new AbortController()
+  const timer = setTimeout(() => timeout.abort(), 15000)
+  const abort = () => timeout.abort()
+  options.signal?.addEventListener('abort', abort, { once: true })
+  if (options.signal?.aborted) timeout.abort()
+  try {
+    return await fetch(`${API}${path}`, { ...options, signal: timeout.signal }).then(jsonResponse)
+  } catch (error) {
+    if (timeout.signal.aborted && !options.signal?.aborted) {
+      throw new Error('The scanner did not respond within 15 seconds. Check the backend connection and retry.')
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', abort)
+  }
 }
-
-interface RiskAssessment {
-  at_risk_now: boolean
-  reasoning?: string
+function validateJob(value: unknown): Job {
+  const job = value as Partial<Job> | null
+  if (!job || typeof job.id !== 'string' || !/^[a-f0-9]{32}$/.test(job.id) ||
+      !['queued', 'downloading', 'scanning', 'completed', 'failed'].includes(job.status || '') ||
+      typeof job.source !== 'string' || !job.stats || typeof job.stats !== 'object') {
+    throw new Error('The dashboard is connected to an outdated or incompatible backend. Restart the ECDAT backend and refresh this page.')
+  }
+  return job as Job
 }
-
-interface PropertyItem {
-  name: string
-  value: string
+function download(data: unknown, name: string) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+  const link = document.createElement('a'); link.href = url; link.download = name; link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
-
-interface Component {
-  name: string
-  evidence?: Evidence
-  properties?: PropertyItem[]
-  riskAssessment?: RiskAssessment
-  cryptoAgilityScore?: number
-}
-
-
-interface AuditStatus {
-  is_valid: boolean
-  broken_index?: number | null
-}
-
-interface Patch {
-  file: string
-  diff: string[]
-  changes?: string[]
-}
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const API = 'http://127.0.0.1:8000'
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function getRecommendation(comp: Component): string {
-  const props = comp.properties ?? []
-  const rec = props.find(p =>
-    ['recommendation', 'Recommendation', 'migration_path', 'note'].includes(p.name)
-  )
-  return rec?.value ?? props[0]?.value ?? '—'
-}
-
-function getCasColor(score: number): string {
-  if (score < 40) return 'text-red-500'
-  if (score < 70) return 'text-yellow-500'
-  return 'text-emerald-500'
-}
-
-function getRingColor(score: number): string {
-  if (score < 40) return '#ef4444'
-  if (score < 70) return '#f59e0b'
-  return '#10b981'
-}
-
-// ─── Sub-components ───────────────────────────────────────────────────────────
-
-function Badge({ ok, label }: { ok: boolean; label: string }) {
-  return (
-    <span
-      className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-        ok
-          ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400'
-          : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400'
-      }`}
-    >
-      {label}
-    </span>
-  )
-}
-
-function Card({ title, children, className = '' }: { title: string; children: ReactNode; className?: string }) {
-  return (
-    <div className={`rounded-2xl bg-white dark:bg-slate-800 shadow-sm border border-slate-200 dark:border-slate-700 p-6 ${className}`}>
-      <h2 className="text-lg font-semibold text-slate-700 dark:text-slate-200 mb-4">{title}</h2>
-      {children}
-    </div>
-  )
-}
-
-function Spinner() {
-  return (
-    <svg
-      className="animate-spin h-5 w-5 text-indigo-500"
-      xmlns="http://www.w3.org/2000/svg"
-      fill="none"
-      viewBox="0 0 24 24"
-    >
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-      <path
-        className="opacity-75"
-        fill="currentColor"
-        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-      />
-    </svg>
-  )
-}
-
-// ─── CAS Ring ─────────────────────────────────────────────────────────────────
-
-function CASRing({ score }: { score: number }) {
-  const radius = 52
-  const circ = 2 * Math.PI * radius
-  const offset = circ - (score / 100) * circ
-  const color = getRingColor(score)
-
-  return (
-    <div className="flex flex-col items-center gap-3">
-      <svg width="140" height="140" viewBox="0 0 140 140">
-        <circle cx="70" cy="70" r={radius} fill="none" stroke="#e2e8f0" strokeWidth="12" />
-        <circle
-          cx="70"
-          cy="70"
-          r={radius}
-          fill="none"
-          stroke={color}
-          strokeWidth="12"
-          strokeDasharray={circ}
-          strokeDashoffset={offset}
-          strokeLinecap="round"
-          transform="rotate(-90 70 70)"
-          style={{ transition: 'stroke-dashoffset 0.6s ease' }}
-        />
-        <text x="70" y="70" textAnchor="middle" dominantBaseline="central" fontSize="26" fontWeight="700" fill={color}>
-          {score.toFixed(1)}
-        </text>
-      </svg>
-      <p className="text-sm text-slate-500 dark:text-slate-400">
-        Average Crypto Agility Score
-      </p>
-      <span
-        className={`text-xs font-semibold px-3 py-1 rounded-full ${
-          score < 40
-            ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400'
-            : score < 70
-            ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400'
-            : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400'
-        }`}
-      >
-        {score < 40 ? 'Critical' : score < 70 ? 'Moderate' : 'Healthy'}
-      </span>
-    </div>
-  )
-}
-
-// ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [components, setComponents] = useState<Component[]>([])
-  const [audit, setAudit] = useState<AuditStatus | null>(null)
-  const [patches, setPatches] = useState<Patch[]>([])
-  const [loadingData, setLoadingData] = useState(true)
-  const [scanning, setScanning] = useState(false)
-  const [verifying, setVerifying] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [scanMsg, setScanMsg] = useState<string | null>(null)
+  const [url, setUrl] = useState('')
+  const [ref, setRef] = useState('')
+  const [job, setJob] = useState<Job | null>(null)
+  const [report, setReport] = useState<Report | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [dragging, setDragging] = useState(false)
+  const [query, setQuery] = useState('')
+  const [severity, setSeverity] = useState('all')
+  const [page, setPage] = useState(0)
+  const [audit, setAudit] = useState('')
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null)
+  const [profile, setProfile] = useState<RiskProfile>({ data_lifetime_years: 10, migration_time_years: 3, criticality: 5, crqc_arrival_years: 10 })
+  const input = useRef<HTMLInputElement>(null)
+  const folderInput = useRef<HTMLInputElement>(null)
+  const active = useRef(false)
+  const alive = useRef(true)
+  const jobId = job?.id
+  useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
 
-  // ── Fetch all data ──
-  const fetchAll = useCallback(async () => {
-    setLoadingData(true)
-    setError(null)
-    try {
-      const [cbomRes, auditRes, patchRes] = await Promise.allSettled([
-        fetch(`${API}/cbom`).then(r => r.json()),
-        fetch(`${API}/audit/verify`).then(r => r.json()),
-        fetch(`${API}/patches`).then(r => r.json()),
-      ])
-      if (cbomRes.status === 'fulfilled') {
-        setComponents((cbomRes.value as { components: Component[] }).components ?? [])
+  useEffect(() => {
+    if (!jobId) return
+    let disposed = false
+    let timer: ReturnType<typeof setTimeout>
+    let failures = 0
+    const controller = new AbortController()
+    const poll = async () => {
+      try {
+        const next = validateJob(await requestJson(`/scans/${jobId}`, { signal: controller.signal }))
+        if (disposed) return
+        if (next.status === 'completed') {
+          const result: Report = await requestJson(`/scans/${jobId}/result`, { signal: controller.signal })
+          if (disposed) return
+          setReport(result); setPage(0); setJob(next); setBusy(false); active.current = false
+          return
+        }
+        if (next.status === 'failed') {
+          setJob(next); setError(next.error || 'Scan failed.'); setBusy(false); active.current = false
+          return
+        }
+        setJob(next)
+        failures = 0
+      } catch (e) {
+        if (disposed) return
+        if (++failures >= 5) {
+          setError(`Connection lost. ${String(e)} Refresh to reconnect to this scan.`)
+          setBusy(false); active.current = false
+          return
+        }
       }
-      if (auditRes.status === 'fulfilled') setAudit(auditRes.value)
-      if (patchRes.status === 'fulfilled') setPatches(patchRes.value)
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setLoadingData(false)
+      timer = setTimeout(poll, 800)
     }
+    timer = setTimeout(poll, 300)
+    return () => { disposed = true; controller.abort(); clearTimeout(timer) }
+  }, [jobId])
+
+  useEffect(() => {
+    const id = localStorage.getItem('ecdat-last-scan')
+    if (!id) return
+    requestJson(`/scans/${id}`).then(validateJob).then(async (saved: Job) => {
+      if (!alive.current || active.current) return
+      if (saved.status === 'completed') {
+        const result = await requestJson(`/scans/${id}/result`)
+        if (!alive.current || active.current) return
+        setReport(result); setJob(saved)
+      } else if (saved.status !== 'failed') {
+        active.current = true; setBusy(true); setJob(saved)
+      }
+    }).catch(() => { /* No saved report on this backend. */ })
   }, [])
 
-  useEffect(() => { fetchAll() }, [fetchAll])
-
-  // ── Run scan ──
-  const runScan = async () => {
-    setScanning(true)
-    setScanMsg(null)
-    try {
-      const res = await fetch(`${API}/scan`, { method: 'POST' })
-      const data = await res.json()
-      setScanMsg(`✓ Scan complete — ${data.components_found ?? '?'} components found`)
-      await fetchAll()
-    } catch (e) {
-      setScanMsg(`✗ Scan failed: ${String(e)}`)
-    } finally {
-      setScanning(false)
-    }
+  function begin() {
+    if (active.current) return false
+    active.current = true; setBusy(true); setError(''); setReport(null); setJob(null); setAudit(''); setQuery(''); setSeverity('all')
+    return true
   }
-
-  // ── Re-verify audit ──
-  const reVerify = async () => {
-    setVerifying(true)
-    try {
-      const res = await fetch(`${API}/audit/verify`)
-      setAudit(await res.json())
-    } finally {
-      setVerifying(false)
-    }
+  function accepted(next: Job) {
+    const valid = validateJob(next)
+    setJob(valid); setUploadProgress(null); localStorage.setItem('ecdat-last-scan', valid.id)
   }
-
-  const avgCAS =
-    components.length > 0
-      ? components.reduce((sum, c) => sum + (c.cryptoAgilityScore ?? 0), 0) / components.length
-      : 0
-
-  // ─────────────────────────────────────────────────────────────────────────────
-
+  function failed(e: unknown) { setError(String(e)); setBusy(false); setUploadProgress(null); active.current = false }
+  function profileQuery() {
+    return new URLSearchParams(Object.entries(profile).map(([key, value]) => [key, String(value)])).toString()
+  }
+  function setProfileNumber(key: keyof RiskProfile, value: string) {
+    const next = Number(value)
+    if (Number.isFinite(next)) setProfile(current => ({ ...current, [key]: next }))
+  }
+  async function startGithub(demo = false) {
+    if (!begin()) return
+    try {
+      const health = await requestJson('/')
+      if (health.version !== '2.0.0') throw new Error('An older ECDAT backend is still running. Restart the backend, then refresh this page and retry.')
+      accepted(await requestJson(demo ? `/scan?${profileQuery()}` : '/scans/github', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        ...(demo ? {} : { body: JSON.stringify({ url: url.trim(), ref: ref.trim(), ...profile }) }),
+      }))
+    } catch (e) { failed(e) }
+  }
+  async function upload(entries: UploadEntry[] | Promise<UploadEntry[]>) {
+    if (!begin()) return
+    try {
+      const file = prepareUpload(await entries)
+      const health = await requestJson('/')
+      if (health.version !== '2.0.0') throw new Error('An older ECDAT backend is running. Restart it and refresh this page.')
+    setUploadProgress(0)
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API}/scans/upload?filename=${encodeURIComponent(file.name)}&${profileQuery()}`)
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    xhr.timeout = 180000
+    xhr.upload.onprogress = e => { if (e.lengthComputable) setUploadProgress(Math.round(e.loaded / e.total * 100)) }
+    xhr.onerror = () => failed('The upload connection was interrupted or a selected file could not be read. Re-select the file or folder and retry at http://localhost:5173/.')
+    xhr.ontimeout = () => failed('Upload timed out. Try a smaller archive.')
+    xhr.onload = () => {
+      try {
+        const data = JSON.parse(xhr.responseText)
+        if (xhr.status >= 400) throw new Error(data.detail || 'Upload failed.')
+        accepted(data)
+      } catch (e) { failed(e) }
+    }
+    xhr.send(file)
+    } catch (e) { failed(e) }
+  }
+  const findings = report?.findings.filter(f => (severity === 'all' || f.severity === severity) && `${f.file} ${f.pattern} ${f.kind}`.toLowerCase().includes(query.toLowerCase())) || []
+  const visible = findings.slice(page * 50, (page + 1) * 50)
+  const high = report?.findings.filter(f => f.severity === 'high').length || 0
+  const stats = report?.stats || job?.stats || {}
   return (
-    <div className="min-h-screen bg-slate-100 dark:bg-slate-900 text-slate-900 dark:text-slate-100 font-sans">
-
-      {/* ── Header ── */}
-      <header className="sticky top-0 z-20 bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 shadow-sm">
-        <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between gap-4 flex-wrap">
-          <div>
-            <h1 className="text-xl font-bold text-indigo-600 dark:text-indigo-400 tracking-tight leading-tight">
-              ECDAT
-            </h1>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Enterprise Cryptographic Discovery &amp; Analysis Tool
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            {scanMsg && (
-              <span className={`text-sm font-medium ${scanMsg.startsWith('✓') ? 'text-emerald-600' : 'text-red-500'}`}>
-                {scanMsg}
-              </span>
-            )}
-            <button
-              onClick={runScan}
-              disabled={scanning}
-              className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-semibold px-4 py-2 transition-colors"
-            >
-              {scanning ? <><Spinner /> Scanning…</> : '▶ Run Scan'}
+    <div className="app-shell">
+      <header><div className="brand"><ShieldCheck size={30} /><div>ECDAT<span>CRYPTOGRAPHIC DISCOVERY</span></div></div><span className="local-tag">Unified scanner <span>v2.0</span></span></header>
+      <main>
+        <section className="intro"><div className="eyebrow">VISIBILITY BEFORE VULNERABILITY</div><h1>Discover the cryptography<br />inside your codebase.</h1><p>One scan for source code, configuration, compiled binaries and container archives. Trace cryptographic evidence back to where it lives.</p><div className="coverage"><span><FileCode2 size={16} /> Any source language</span><span><Binary size={16} /> Binary signatures</span><span><Box size={16} /> Container layers</span></div></section>
+        <details className="risk-profile"><summary>Risk context for this scan</summary><p>Mosca risk compares how long data must remain protected, expected migration time and your CRQC planning horizon. These values are included in the report.</p><div className="risk-inputs"><label>Data lifetime (years)<input type="number" min="0" max="100" value={profile.data_lifetime_years} onChange={e => setProfileNumber('data_lifetime_years', e.target.value)} disabled={busy} /></label><label>Migration time (years)<input type="number" min="0" max="100" value={profile.migration_time_years} onChange={e => setProfileNumber('migration_time_years', e.target.value)} disabled={busy} /></label><label>Business criticality (1–10)<input type="number" min="1" max="10" value={profile.criticality} onChange={e => setProfileNumber('criticality', e.target.value)} disabled={busy} /></label><label>CRQC planning horizon (years)<input type="number" min="0" max="100" value={profile.crqc_arrival_years} onChange={e => setProfileNumber('crqc_arrival_years', e.target.value)} disabled={busy} /></label></div></details>
+        <section className="input-grid" aria-label="Start a scan">
+          <div className="panel"><div className="panel-title"><GitBranch size={22} /><h2>Import a repository</h2><span className="tag">PUBLIC GITHUB</span></div><p>Scan a repository directly from its GitHub URL.</p><form onSubmit={e => { e.preventDefault(); void startGithub() }}><label htmlFor="repo">Repository URL</label><input id="repo" type="url" required placeholder="https://github.com/owner/repository" value={url} onChange={e => setUrl(e.target.value)} disabled={busy} /><label htmlFor="branch">Branch, tag or commit <span className="muted">(optional)</span></label><input id="branch" placeholder="Default branch" value={ref} onChange={e => setRef(e.target.value)} disabled={busy} /><button className="primary" disabled={busy || !url.trim()} type="submit">Scan repository <ArrowRight size={17} /></button></form></div>
+          <div className="panel">
+            <div className="panel-title"><UploadCloud size={22} /><h2>Upload your codebase</h2></div>
+            <p>Drop a folder, repository archive, container export or source file.</p>
+            <button type="button" className={`dropzone ${dragging ? 'dragging' : ''}`} disabled={busy}
+              onClick={() => input.current?.click()}
+              onDragOver={e => { e.preventDefault(); setDragging(true) }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={e => { e.preventDefault(); setDragging(false); if (!busy) void upload(droppedFiles(e.dataTransfer.items, e.dataTransfer.files)) }}>
+              <UploadCloud size={35} /><strong>Drag & drop files or a folder here</strong>
+              <span>or <b>browse files</b></span><small>Folders, ZIP, TAR, TAR.GZ, JAR, binaries or source files - up to 128 MiB</small>
             </button>
+            <button type="button" className="text-button" disabled={busy} onClick={() => folderInput.current?.click()}>Choose folder</button>
+            <input ref={input} type="file" multiple hidden onChange={e => { if (e.target.files?.length) void upload(selectedFiles(e.target.files)); e.target.value = '' }} />
+            <input ref={folderInput} type="file" multiple hidden {...{ webkitdirectory: '' }} onChange={e => { if (e.target.files?.length) void upload(selectedFiles(e.target.files)); e.target.value = '' }} />
+            <div className="upload-note">Folder structure is preserved. For containers, upload an archive from <code>docker save</code> or an OCI image export.</div>
           </div>
-        </div>
-      </header>
-
-      <main className="max-w-7xl mx-auto px-6 py-8 space-y-8">
-
-        {/* ── Loading / Error state ── */}
-        {loadingData && (
-          <div className="flex items-center gap-3 text-slate-500 dark:text-slate-400">
-            <Spinner /> <span>Loading data from backend…</span>
-          </div>
-        )}
-        {error && (
-          <div className="rounded-xl bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 p-4 text-red-700 dark:text-red-400 text-sm">
-            ⚠ {error} — make sure the FastAPI server is running on port 8000 and has been scanned.
-          </div>
-        )}
-
-        {/* ── Top row: CAS Overview + Audit Trail ── */}
-        {!loadingData && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-
-            {/* CAS Overview */}
-            <Card title="CAS Overview">
-              {components.length === 0 ? (
-                <p className="text-sm text-slate-400">No data — run a scan first.</p>
-              ) : (
-                <div className="flex justify-center">
-                  <CASRing score={avgCAS} />
-                </div>
-              )}
-            </Card>
-
-            {/* Audit Trail */}
-            <Card title="Audit Trail">
-              {audit == null ? (
-                <p className="text-sm text-slate-400">No audit log — run a scan first.</p>
-              ) : (
-                <div className="flex flex-col gap-4">
-                  <div className="flex items-center gap-3">
-                    {audit.is_valid ? (
-                      <span className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400 font-semibold text-base">
-                        <span className="text-xl">✓</span> Audit Chain Verified
-                      </span>
-                    ) : (
-                      <span className="flex items-center gap-2 text-red-600 dark:text-red-400 font-semibold text-base">
-                        <span className="text-xl">✗</span> Tampering Detected at block {audit.broken_index ?? '?'}
-                      </span>
-                    )}
-                  </div>
-                  <button
-                    onClick={reVerify}
-                    disabled={verifying}
-                    className="self-start inline-flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-600 hover:bg-slate-50 dark:hover:bg-slate-700 text-sm font-medium px-4 py-2 transition-colors"
-                  >
-                    {verifying ? <><Spinner /> Verifying…</> : '↻ Re-verify'}
-                  </button>
-                </div>
-              )}
-            </Card>
-          </div>
-        )}
-
-        {/* ── Risk Heatmap ── */}
-        {!loadingData && components.length > 0 && (
-          <Card title="Risk Heatmap">
-            <div className="flex flex-wrap gap-3">
-              {components.map((comp, i) => {
-                const risk = comp.riskAssessment?.at_risk_now ?? false
-                return (
-                  <div
-                    key={i}
-                    title={risk ? 'AT RISK' : 'OK'}
-                    className={`flex items-center justify-center rounded-xl px-4 py-3 text-xs font-semibold text-white text-center max-w-[130px] break-words shadow-sm ${
-                      risk
-                        ? 'bg-red-500 dark:bg-red-600'
-                        : 'bg-emerald-500 dark:bg-emerald-600'
-                    }`}
-                  >
-                    {comp.name}
-                  </div>
-                )
-              })}
-            </div>
-          </Card>
-        )}
-
-        {/* ── Findings Table ── */}
-        {!loadingData && components.length > 0 && (
-          <Card title="Findings" className="overflow-hidden">
-            <div className="overflow-x-auto -mx-6 -mb-6 px-6">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-slate-200 dark:border-slate-700 text-left text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                    <th className="pb-3 pr-4 font-semibold">Algorithm</th>
-                    <th className="pb-3 pr-4 font-semibold">File</th>
-                    <th className="pb-3 pr-4 font-semibold">Line</th>
-                    <th className="pb-3 pr-4 font-semibold">Recommendation</th>
-                    <th className="pb-3 pr-4 font-semibold">Risk</th>
-                    <th className="pb-3 font-semibold">CAS</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {components.map((comp, i) => {
-                    const occ = comp.evidence?.occurrences?.[0]
-                    const filePath = occ?.location ?? '—'
-                    const fileName = filePath.split(/[\\/]/).pop() ?? filePath
-                    const line = occ?.line ?? '—'
-                    const risk = comp.riskAssessment?.at_risk_now ?? false
-                    const cas = comp.cryptoAgilityScore ?? 0
-                    return (
-                      <tr
-                        key={i}
-                        className="border-b border-slate-100 dark:border-slate-700/50 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors"
-                      >
-                        <td className="py-3 pr-4 font-mono font-semibold text-indigo-600 dark:text-indigo-400">
-                          {comp.name}
-                        </td>
-                        <td className="py-3 pr-4 text-slate-600 dark:text-slate-300 truncate max-w-[180px]" title={filePath}>
-                          {fileName}
-                        </td>
-                        <td className="py-3 pr-4 text-slate-500 dark:text-slate-400">{String(line)}</td>
-                        <td className="py-3 pr-4 text-slate-600 dark:text-slate-300 max-w-[200px]">
-                          {getRecommendation(comp)}
-                        </td>
-                        <td className="py-3 pr-4">
-                          <Badge ok={!risk} label={risk ? 'AT RISK' : 'OK'} />
-                        </td>
-                        <td className={`py-3 font-bold tabular-nums ${getCasColor(cas)}`}>
-                          {cas}
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </Card>
-        )}
-
-        {/* ── Patch Viewer ── */}
-        {!loadingData && patches.length > 0 && (
-          <Card title="Patch Viewer">
-            <div className="space-y-6">
-              {patches.map((patch, pi) => (
-                <div key={pi}>
-                  <p className="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-2 font-mono">
-                    📄 {patch.file}
-                  </p>
-                  <div className="rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 text-xs font-mono">
-                    {patch.diff.length === 0 ? (
-                      <p className="px-4 py-3 text-slate-400">No diff available.</p>
-                    ) : (
-                      patch.diff.map((line, li) => {
-                        const isAdd = line.startsWith('+')
-                        const isDel = line.startsWith('-')
-                        return (
-                          <div
-                            key={li}
-                            className={`px-4 py-0.5 whitespace-pre-wrap break-all ${
-                              isAdd
-                                ? 'bg-emerald-50 dark:bg-emerald-900/25 text-emerald-700 dark:text-emerald-400'
-                                : isDel
-                                ? 'bg-red-50 dark:bg-red-900/25 text-red-700 dark:text-red-400'
-                                : 'bg-slate-50 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
-                            }`}
-                          >
-                            {line}
-                          </div>
-                        )
-                      })
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </Card>
-        )}
-
-        {/* ── Empty state ── */}
-        {!loadingData && components.length === 0 && !error && (
-          <div className="rounded-2xl border-2 border-dashed border-slate-300 dark:border-slate-600 p-12 text-center">
-            <p className="text-slate-400 dark:text-slate-500 text-lg">No scan data yet.</p>
-            <p className="text-slate-400 dark:text-slate-500 text-sm mt-1">
-              Click <strong>Run Scan</strong> to analyse your demo-data directory.
-            </p>
-          </div>
-        )}
-
-      </main>
+        </section>
+        <div className="demo-row"><span>Want to see how it works?</span><button className="text-button" disabled={busy} onClick={() => void startGithub(true)}>Scan the bundled demo <ArrowRight size={14} /></button></div>
+        {error && <div className="notice error" role="alert"><AlertTriangle size={20} />{error}</div>}
+        {busy && <div className="panel progress" role="status" aria-live="polite"><LoaderCircle className="spin" /><div><strong>{uploadProgress !== null ? `Uploading · ${uploadProgress}%` : `${job?.status || 'Submitting'}…`}</strong><p>{job?.source || 'Preparing your scan'}{stats.files_scanned ? ` · ${stats.files_scanned} files inspected` : ''}</p></div><span>Runs in the background</span></div>}
+        {report && <section className="results">
+          {report.audit_error && <div className="notice warning" role="alert"><AlertTriangle size={20} />{report.audit_error}</div>}
+          <div className="results-heading"><div className="eyebrow">SCAN RESULTS</div><h2>{report.source}</h2><div className="actions"><button onClick={() => download(report, `ecdat-${report.id}.json`)}><Download size={16} /> Full report</button><button onClick={() => download(report.cbom, `cbom-${report.id}.json`)}><Download size={16} /> CBOM</button><button onClick={async () => { try { const data = await requestJson('/audit/verify'); setAudit(data.is_valid ? `Audit verified · ${data.reports_verified} reports and ${data.records} records match` : `Audit check failed${data.report_errors?.length ? ` · ${data.report_errors.length} report mismatch(es)` : ''}`) } catch (e) { setAudit(String(e)) } }}><ShieldCheck size={16} /> Verify audit</button></div>{audit && <p role="status">{audit}</p>}</div>
+          <div className="metrics"><div><span>Files inspected</span><strong>{stats.files_scanned}</strong><small>{stats.binary_files} binary · {stats.text_files} text</small></div><div><span>Crypto evidence</span><strong>{report.findings.length}</strong><small>{new Set(report.findings.map(f => f.pattern)).size} algorithm / asset types</small></div><div><span>High priority</span><strong className={high ? 'danger' : ''}>{high}</strong><small>Requires contextual review</small></div><div><span>Scan duration</span><strong>{stats.duration_seconds}s</strong><small>{stats.archives_opened} archives opened</small></div></div>
+          {report.risk_summary && <div className="risk-summary"><div><span>Quantum-vulnerable assets</span><strong>{report.risk_summary.quantum_vulnerable_assets}</strong></div><div><span>At risk under your Mosca profile</span><strong className={report.risk_summary.at_risk_now ? 'danger' : ''}>{report.risk_summary.at_risk_now}</strong></div><div><span>Crypto-Agility Score</span><strong>{report.risk_summary.average_crypto_agility_score ?? '—'}</strong><small>0 = least ready, 100 = most ready</small></div><p>Profile: data lifetime {report.profile.data_lifetime_years}y · migration {report.profile.migration_time_years}y · CRQC horizon {report.profile.crqc_arrival_years}y · criticality {report.profile.criticality}/10.</p></div>}
+          {report.partial && <div className="notice warning"><AlertTriangle size={20} /><div><strong>Partial coverage · {stats.files_skipped} entries skipped</strong><details><summary>See coverage details</summary><ul>{report.warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul>{(stats.files_skipped || 0) > report.warnings.length && <p>Only the first 200 warnings are shown.</p>}</details></div></div>}
+          <div className="panel findings"><div className="toolbar"><h2>Findings <span className="tag">{findings.length}</span></h2><div className="filters"><div className="search"><Search size={16} /><input aria-label="Search findings" placeholder="Search algorithm or path" value={query} onChange={e => { setQuery(e.target.value); setPage(0) }} /></div><select aria-label="Filter by priority" value={severity} onChange={e => { setSeverity(e.target.value); setPage(0) }}><option value="all">All priorities</option><option value="high">High priority</option><option value="review">Review</option><option value="info">Informational</option></select></div></div>
+          <div className="table-scroll"><table><thead><tr><th>Asset / priority</th><th>Location</th><th>Evidence</th><th>Risk</th><th>Recommendation</th></tr></thead><tbody>{visible.map((f, i) => <tr key={`${page}-${i}`}><td><strong>{f.pattern}</strong><span className={`severity ${f.severity}`}>{f.severity}</span></td><td className="location">{f.file}<small>{f.line !== null ? `Line ${f.line}` : `Byte offset ${f.offset}`} · {f.kind}</small></td><td><code>{f.evidence}</code><small>{f.confidence} confidence</small></td><td>{f.riskAssessment ? <><strong>{f.riskAssessment.risk_score}/10</strong><small>{f.quantum_vulnerable ? (f.riskAssessment.at_risk_now ? 'Quantum risk now' : 'Quantum vulnerable') : f.classification}</small><small>CAS {f.cryptoAgilityScore}</small></> : '—'}</td><td>{f.recommendation}</td></tr>)}</tbody></table></div>
+          {!findings.length && <div className="empty">{report.findings.length ? 'No findings match these filters.' : 'No matching cryptographic signatures were found in the inspected content.'}</div>}
+          {findings.length > 50 && <div className="pagination"><span>Page {page + 1} of {Math.ceil(findings.length / 50)}</span><button disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button><button disabled={(page + 1) * 50 >= findings.length} onClick={() => setPage(page + 1)}>Next</button></div>}</div>
+          <p className="disclaimer">Signature matches are discovery evidence, not proof of a vulnerability or secure implementation. Comments and documentation can match. Binary findings use visible strings, not decompilation. Container results include historical layers, not a reconstructed runtime filesystem.</p>
+        </section>}
+        {!busy && !report && <div className="empty-state"><ShieldCheck size={26} /><div><strong>Your next scan starts here</strong><p>Import a repository or upload a file to build your cryptographic inventory.</p></div></div>}
+      </main><footer><span>ECDAT · Enterprise Cryptographic Discovery & Analysis Tool</span><span>Static inspection · Uploaded code is never executed</span></footer>
     </div>
   )
 }

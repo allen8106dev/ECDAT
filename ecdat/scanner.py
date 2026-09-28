@@ -1,133 +1,280 @@
-"""
-scanner.py - AST-based cryptographic scanner for detecting vulnerable and legacy algorithms.
-"""
-
-import ast
+﻿"""Bounded language-independent discovery; scanned content is never executed."""
+import io
 import os
 import re
-from pathlib import Path
-from typing import Any, Dict, List
+import stat
+import tarfile
+import time
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 
-# Target patterns (case-insensitive) and their post-quantum / modern recommendations
-PATTERNS = ["md5", "sha1", "DES", "RSA", "ECDSA"]
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 
-RECOMMENDATIONS: Dict[str, str] = {
-    "MD5": "MD5/SHA1 -> SHA-256 (MD5 is broken; migrate to SHA-256)",
-    "SHA1": "MD5/SHA1 -> SHA-256 (SHA-1 is weak; migrate to SHA-256)",
-    "DES": "DES -> AES-256 (DES 56-bit key is insecure; migrate to AES-256)",
-    "RSA": "RSA -> ML-KEM (FIPS 203) (Classical RSA is vulnerable to Shor's algorithm)",
-    "ECDSA": "ECDSA -> ML-DSA (FIPS 204) (Classical ECDSA is vulnerable to Shor's algorithm)",
-}
+RULES = [
+ ('MD5', r'md5(?:CryptoServiceProvider)?', 'high', 'Avoid MD5 for security decisions; review use and migrate to SHA-256 or stronger.'),
+ ('SHA1', r'sha[-_]?1(?:Managed|CryptoServiceProvider)?', 'high', 'Avoid SHA-1 for signatures and collision-sensitive uses.'),
+ ('3DES', r'(?:3des|des3|tripledes|des-ede3)', 'high', 'Migrate triple DES to authenticated AES-GCM.'),
+ ('DES', r'des', 'high', 'Replace DES with authenticated modern encryption.'),
+ ('RC4', r'(?:rc4|arc4|arcfour)', 'high', 'Replace RC4 with AES-GCM or ChaCha20-Poly1305.'),
+ ('RSA', r'rsa(?:encryption)?', 'review', 'Review key size, padding and purpose; plan post-quantum migration separately for encryption and signatures.'),
+ ('ECDSA', r'ecdsa', 'review', 'Review curve and signature use; plan post-quantum signature migration.'),
+ ('ECDH', r'ecdh', 'review', 'Review key exchange and post-quantum or hybrid migration.'),
+ ('AES', r'aes(?:[-_]?(?:128|192|256)|Gcm|Ccm|Managed|CryptoServiceProvider)?', 'info', 'Confirm key handling, unique nonces and authenticated mode.'),
+ ('SHA256', r'sha[-_]?256(?:Managed|CryptoServiceProvider)?', 'info', 'Modern hash detected; suitability depends on context.'),
+ ('SHA384', r'sha[-_]?384', 'info', 'Modern hash detected; suitability depends on context.'),
+ ('SHA512', r'sha[-_]?512', 'info', 'Modern hash detected; suitability depends on context.'),
+ ('SHA3', r'sha3(?:[-_]?\d+)?', 'info', 'Modern hash detected; suitability depends on context.'),
+ ('ChaCha20', r'chacha20(?:poly1305)?', 'info', 'Confirm authenticated encryption and unique nonces.'),
+ ('Ed25519', r'ed25519', 'review', 'Modern classical signature; review post-quantum requirements.'),
+ ('ML-KEM', r'(?:ml[-_]?kem(?:[-_]?\d+)?|kyber\d*)', 'info', 'Confirm standardized ML-KEM implementation and parameter set.'),
+ ('ML-DSA', r'(?:ml[-_]?dsa(?:[-_]?\d+)?|dilithium\d*)', 'info', 'Confirm standardized ML-DSA implementation and parameter set.'),
+ ('bcrypt', r'bcrypt', 'info', 'Review password hashing work factor.'),
+ ('scrypt', r'scrypt', 'info', 'Review password hashing memory and work factors.'),
+ ('Argon2', r'argon2(?:id|i|d)?', 'info', 'Review password hashing parameters; prefer Argon2id.'),
+ ('PBKDF2', r'pbkdf2(?:hmac)?', 'review', 'Review PRF, salt and iteration count.'),
+ ('ECB', r'(?:mode[_-]ecb|aes/ecb|ecb)', 'high', 'ECB reveals patterns; use authenticated encryption where applicable.'),
+ ('Private key', r'-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----', 'high', 'Review embedded private key material; remove and rotate if exposed.'),
+ ('Certificate', r'-----BEGIN CERTIFICATE-----', 'info', 'Review certificate validity, algorithm and trust configuration.'),
+ ('OpenSSL', r'(?:openssl|libcrypto|libssl)', 'review', 'Crypto library reference detected; review version and configuration.'),
+]
+SIGNATURE = re.compile(r'(?<![a-z0-9])(?:' + '|'.join(f'(?P<R{i}>{pattern})' for i, (_, pattern, _, _) in enumerate(RULES)) + r')(?![a-z0-9])', re.I)
+RECOMMENDATIONS = {name: rec for name, _, _, rec in RULES}
+EXCLUDED = {'.git', '.svn', '__pycache__', '.venv', 'venv', 'node_modules'}
+MAX_FILE = 32 * 1024 * 1024
+MAX_TOTAL = 512 * 1024 * 1024
+MAX_FILES = 20000
+MAX_FINDINGS = 20000
+MAX_SECONDS = 120
+CERTIFICATE_BLOCK = re.compile(br"-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----")
+PRIVATE_KEY_BLOCK = re.compile(br"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
 
+class ScanLimit(ValueError):
+    pass
 
-def get_call_name(node: ast.AST) -> str:
-    """Recursively extract the dotted function/attribute name from an AST call node."""
-    if isinstance(node, ast.Name):
-        return node.id
-    elif isinstance(node, ast.Attribute):
-        prefix = get_call_name(node.value)
-        if prefix:
-            return f"{prefix}.{node.attr}"
-        return node.attr
-    return ""
+class Scanner:
+    def __init__(self, progress=None):
+        self.findings, self.warnings = [], []
+        self.stats = dict(files_scanned=0, files_skipped=0, archives_opened=0, bytes_scanned=0, text_files=0, binary_files=0)
+        self.visited = self.expanded = 0
+        self.started = time.monotonic()
+        self.progress = progress or (lambda _: None)
 
+    def check(self):
+        if time.monotonic() - self.started > MAX_SECONDS:
+            raise ScanLimit('Scan time limit reached; coverage is partial.')
+        if self.visited >= MAX_FILES or self.expanded >= MAX_TOTAL or len(self.findings) >= MAX_FINDINGS:
+            raise ScanLimit('Scan resource limit reached; coverage is partial.')
 
-def match_pattern(call_name: str) -> str | None:
-    """
-    Check if the function call name contains any of the target patterns (case-insensitive).
-    Splits by dots and underscores to match constituent algorithm tokens accurately.
-    """
-    tokens = re.split(r"[._]", call_name)
-    tokens_upper = {token.upper() for token in tokens if token}
+    def skip(self, name, reason):
+        self.stats['files_skipped'] += 1
+        if len(self.warnings) < 200:
+            self.warnings.append(f'{name}: {reason}')
 
-    for pattern in PATTERNS:
-        if pattern.upper() in tokens_upper:
-            return pattern.upper()
-    return None
+    @staticmethod
+    def safe_name(name):
+        p = PurePosixPath(name.replace('\\', '/'))
+        return not (p.is_absolute() or '..' in p.parts or ':' in name or '\x00' in name)
 
+    def read_member(self, stream, size, name, depth):
+        self.check()
+        self.visited += 1
+        if not self.safe_name(name):
+            self.skip(name, 'unsafe path')
+            return
+        if any(p in EXCLUDED for p in PurePosixPath(name).parts):
+            self.skip(name, 'excluded dependency/cache directory')
+            return
+        cap = min(MAX_TOTAL - self.expanded, 128 * 1024 * 1024)
+        if size > cap:
+            self.skip(name, 'member exceeds expansion limit')
+            return
+        data = stream.read(cap + 1)
+        self.expanded += len(data)
+        if len(data) > cap:
+            raise ScanLimit('Expanded content limit reached; coverage is partial.')
+        self.content(data, name, depth)
 
-def scan_file(filepath: str | Path) -> List[Dict[str, Any]]:
-    """Parse a single Python file using ast and return any cryptographic findings."""
-    path_obj = Path(filepath)
-    findings: List[Dict[str, Any]] = []
-
-    try:
-        source_code = path_obj.read_text(encoding="utf-8")
-        tree = ast.parse(source_code, filename=str(path_obj))
-    except Exception as exc:
-        print(f"[-] Error parsing {path_obj.name}: {exc}")
-        return findings
-
-    # Walk the AST to inspect all function call nodes
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            call_name = get_call_name(node.func)
-            if not call_name:
+    def content(self, data, name, depth=0):
+        self.check()
+        if data.startswith((b'\x28\xb5\x2f\xfd', b'7z\xbc\xaf\x27\x1c', b'Rar!')):
+            self.skip(name, 'unsupported compressed format (zstd, 7z or RAR); upload ZIP or TAR.GZ instead')
+            return
+        is_zip = data.startswith((b'PK\x03\x04', b'PK\x05\x06'))
+        is_tar = data[257:262] == b'ustar' or data.startswith(b'\x1f\x8b') or name.lower().endswith(('.tar', '.tgz', '.tar.gz'))
+        if is_zip or is_tar:
+            if depth >= 4:
+                self.skip(name, 'archive nesting limit')
+                return
+            self.stats['archives_opened'] += 1
+            try:
+                if is_zip:
+                    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                        for item in archive.infolist():
+                            self.check()
+                            if item.is_dir():
+                                continue
+                            child = f'{name}!/{item.filename}'
+                            if not self.safe_name(item.filename) or stat.S_ISLNK(item.external_attr >> 16) or item.flag_bits & 1:
+                                self.skip(child, 'unsafe path, link or encrypted entry')
+                                continue
+                            with archive.open(item) as stream:
+                                self.read_member(stream, item.file_size, child, depth + 1)
+                else:
+                    with tarfile.open(fileobj=io.BytesIO(data), mode='r|*') as archive:
+                        for item in archive:
+                            self.check()
+                            if item.isdir():
+                                continue
+                            child = f'{name}!/{item.name}'
+                            if not item.isfile() or not self.safe_name(item.name):
+                                self.skip(child, 'unsafe path, link or special file')
+                                continue
+                            with archive.extractfile(item) as stream:
+                                self.read_member(stream, item.size, child, depth + 1)
+            except (OSError, ValueError, EOFError, RuntimeError, tarfile.TarError, zipfile.BadZipFile) as exc:
+                if isinstance(exc, ScanLimit):
+                    raise
+                self.skip(name, 'unreadable archive: ' + str(exc)[:160])
+            return
+        if len(data) > MAX_FILE:
+            self.skip(name, 'file exceeds 32 MiB inspection limit')
+            return
+        binary = b'\x00' in data[:8192] and not data.startswith((b'\xff\xfe', b'\xfe\xff'))
+        if binary:
+            text = data.decode('latin1')  # Preserves byte offsets.
+        else:
+            try:
+                text = data.decode('utf-16' if data.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig')
+            except UnicodeDecodeError:
+                binary = True
+                text = data.decode('latin1')
+        self.stats['files_scanned'] += 1
+        self.stats['binary_files' if binary else 'text_files'] += 1
+        self.stats['bytes_scanned'] += len(data)
+        structured_patterns = self.crypto_metadata(data, name, binary)
+        seen, line, previous = set(), 1, 0
+        for match in SIGNATURE.finditer(text):
+            self.check()
+            algorithm, _, severity, recommendation = RULES[int(match.lastgroup[1:])]
+            if algorithm in structured_patterns:
                 continue
+            line += text.count('\n', previous, match.start())
+            previous = match.start()
+            location = match.start() if binary else line
+            key = algorithm, location
+            if key in seen:
+                continue
+            seen.add(key)
+            self.findings.append(dict(file=name, line=None if binary else line, offset=match.start() if binary else None,
+                pattern=algorithm, call=match.group(), evidence=match.group(), kind='binary' if binary else 'text',
+                confidence='low' if binary else 'medium', severity=severity, recommendation=recommendation))
+        self.progress(dict(self.stats))
 
-            matched = match_pattern(call_name)
-            if matched:
-                findings.append(
+    def crypto_metadata(self, data, name, binary):
+        structured_patterns = set()
+        if binary:
+            return structured_patterns
+        certificate_blocks = CERTIFICATE_BLOCK.findall(data)
+        if not certificate_blocks and name.lower().endswith(('.cer', '.crt', '.der')):
+            certificate_blocks = [data]
+        for block in certificate_blocks:
+            try:
+                certificate = x509.load_pem_x509_certificate(block) if block.startswith(b'-----') else x509.load_der_x509_certificate(block)
+                public_key = certificate.public_key()
+                key_size = getattr(public_key, 'key_size', None)
+                key_algorithm = public_key.__class__.__name__.replace('PublicKey', '')
+                expires = certificate.not_valid_after_utc
+                finding = self.structured_finding(
+                    name, data, block, 'Certificate', 'certificate',
+                    'high' if expires < datetime.now(timezone.utc) else 'info',
+                    'Review certificate validity, signature algorithm, key size and trust configuration.',
                     {
-                        "file": path_obj.name,
-                        "line": getattr(node, "lineno", 0),
-                        "pattern": matched,
-                        "call": call_name,
-                        "recommendation": RECOMMENDATIONS.get(
-                            matched, "Upgrade to modern standard"
-                        ),
-                    }
+                        'public_key_algorithm': key_algorithm,
+                        **({'public_key_size': key_size} if key_size else {}),
+                        'signature_algorithm': certificate.signature_hash_algorithm.name if certificate.signature_hash_algorithm else 'unknown',
+                        'valid_from': certificate.not_valid_before_utc.isoformat(),
+                        'valid_until': expires.isoformat(),
+                        'expired': expires < datetime.now(timezone.utc),
+                    },
                 )
+                self.findings.append(finding)
+                structured_patterns.add('Certificate')
+            except (ValueError, TypeError):
+                self.skip(name, 'certificate data could not be parsed')
+        for block in PRIVATE_KEY_BLOCK.findall(data):
+            try:
+                key = serialization.load_pem_private_key(block, password=None)
+                key_size = getattr(key, 'key_size', None)
+                key_algorithm = key.__class__.__name__.replace('PrivateKey', '')
+                self.findings.append(self.structured_finding(
+                    name, data, block, 'Private key', 'key-material', 'high',
+                    'Move private keys out of source or image layers, rotate exposed keys, and use managed secret storage.',
+                    {'key_algorithm': key_algorithm, **({'key_size': key_size} if key_size else {}), 'encrypted': False},
+                ))
+                structured_patterns.add('Private key')
+            except (ValueError, TypeError):
+                self.findings.append(self.structured_finding(
+                    name, data, block, 'Private key', 'key-material', 'high',
+                    'Review embedded private key material; remove and rotate if exposed.', {'encrypted_or_unreadable': True},
+                ))
+                structured_patterns.add('Private key')
+        return structured_patterns
 
-    return findings
+    @staticmethod
+    def structured_finding(name, data, block, pattern, asset_type, severity, recommendation, metadata):
+        offset = data.find(block)
+        line = data[:offset].count(b'\n') + 1
+        return {
+            'file': name,
+            'line': line,
+            'offset': None,
+            'pattern': pattern,
+            'call': pattern,
+            'evidence': f"{pattern}: " + ', '.join(f'{key.replace("_", " ")}={value}' for key, value in metadata.items() if key not in {'expired', 'encrypted'}),
+            'kind': asset_type,
+            'confidence': 'high',
+            'severity': severity,
+            'recommendation': recommendation,
+            'asset_type': asset_type,
+            'metadata': metadata,
+        }
 
+    def directory(self, root):
+        root = Path(root)
+        if not root.is_dir():
+            raise ValueError('Scan directory does not exist')
+        try:
+            for parent, dirs, files in os.walk(root, followlinks=False):
+                for directory in list(dirs):
+                    if directory in EXCLUDED or (Path(parent) / directory).is_symlink():
+                        dirs.remove(directory)
+                        self.skip(str((Path(parent) / directory).relative_to(root)), 'excluded directory or link')
+                for filename in sorted(files):
+                    self.check()
+                    path = Path(parent) / filename
+                    name = path.relative_to(root).as_posix()
+                    if path.is_symlink():
+                        self.skip(name, 'symbolic link')
+                        continue
+                    try:
+                        with path.open('rb') as stream:
+                            self.read_member(stream, path.stat().st_size, name, 0)
+                    except OSError:
+                        self.skip(name, 'unreadable file')
+        except ScanLimit as exc:
+            self.skip('Scan', str(exc))
+        self.findings.sort(key=lambda f: (f['file'], f['line'] or 0, f['offset'] or 0, f['pattern']))
+        return dict(findings=self.findings, stats={**self.stats, 'duration_seconds': round(time.monotonic() - self.started, 3)},
+                    warnings=self.warnings, partial=bool(self.stats['files_skipped']))
 
-def scan_directory(path: str | Path) -> List[Dict[str, Any]]:
-    """Scan all .py files in a folder and return a list of finding dictionaries."""
-    dir_path = Path(path)
-    all_findings: List[Dict[str, Any]] = []
+def scan_directory(path):
+    return Scanner().directory(path)['findings']
 
-    if not dir_path.is_dir():
-        print(f"[-] Path is not a directory: {dir_path}")
-        return all_findings
-
-    # Scan all Python files in the directory
-    py_files = sorted(dir_path.glob("*.py"))
-    for py_file in py_files:
-        file_findings = scan_file(py_file)
-        all_findings.extend(file_findings)
-
-    # Sort findings consistently by filename and line number
-    all_findings.sort(key=lambda item: (item["file"], item["line"]))
-    return all_findings
-
-
-if __name__ == "__main__":
-    target_directory = "./demo-data"
-
-    # Fallback to local demo-data if running from outside the project directory
-    if not Path(target_directory).exists():
-        fallback = Path(__file__).parent / "demo-data"
-        if fallback.exists():
-            target_directory = str(fallback)
-
-    print("=" * 80)
-    print("                    ECDAT Cryptographic Algorithm Scanner")
-    print("=" * 80)
-    print(f"Scanning target directory: {target_directory}\n")
-
-    findings = scan_directory(target_directory)
-
-    if not findings:
-        print("[+] No cryptographic vulnerabilities found.")
-    else:
-        print(f"Found {len(findings)} cryptographic finding(s):\n")
-        for idx, finding in enumerate(findings, start=1):
-            print(f"[{idx}] File           : {finding['file']} (line {finding['line']})")
-            print(f"    Call Detected  : {finding['call']}")
-            print(f"    Pattern Match  : {finding['pattern']}")
-            print(f"    Recommendation : {finding['recommendation']}")
-            print("-" * 80)
-
-    print(f"\nScan completed. Total findings: {len(findings)}")
-
+def scan_file(filepath):
+    path = Path(filepath)
+    scanner = Scanner()
+    with path.open('rb') as stream:
+        scanner.read_member(stream, path.stat().st_size, path.name, 0)
+    return scanner.findings

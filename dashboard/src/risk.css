@@ -1,0 +1,6 @@
+.risk-profile{background:#fff;border:1px solid #dfe6ec;border-radius:10px;padding:14px 18px;margin:-12px 0 24px;color:#5f7180;font-size:12px}
+.risk-profile summary{cursor:pointer;font-weight:700;color:#286b60}.risk-profile p{line-height:1.6;margin:11px 0}
+.risk-inputs{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.risk-inputs label{margin:0}.risk-inputs input{display:block;width:100%;margin-top:6px}
+.risk-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;align-items:start;background:#edf8f4;border:1px solid #cce8dd;border-radius:10px;padding:18px;margin:-8px 0 23px}
+.risk-summary div span,.risk-summary div small{display:block;font-size:10px;color:#5c7c75}.risk-summary div strong{display:block;font-size:24px;margin:5px 0;color:#226e60}.risk-summary p{grid-column:1/-1;font-size:11px;color:#58746e;margin:0}
+@media(max-width:800px){.risk-inputs,.risk-summary{grid-template-columns:repeat(2,1fr)}}
