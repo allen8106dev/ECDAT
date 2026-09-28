@@ -1,10 +1,10 @@
 # ECDAT — Unified cryptographic discovery
 
-Scan a public GitHub repository, drop a repository ZIP/TAR archive, or upload a source file, binary, JAR/WAR, or exported container image. The React dashboard submits background scan jobs to FastAPI, displays progress and searchable findings, and exports JSON reports and a CycloneDX-style CBOM. Each completed scan has an isolated ID and a hash-chained audit record.
+Scan an HTTPS Git repository (or configured SSH repository), drop a repository ZIP/TAR archive, or upload a source file, binary, JAR/WAR, or exported container image. The React dashboard submits background scan jobs to FastAPI, displays progress and searchable findings, and exports JSON reports and a schema-validated CycloneDX 1.6 CBOM. Each completed scan has an isolated ID and a hash-chained audit record.
 
 ## Run locally
 
-Requires Python 3.10+ and Node.js 22.12+ (tested with Node.js 24.16).
+Requires Python 3.12+ and Node.js 22.12+ (tested with Node.js 24.16).
 
 From the repository root, in one terminal:
 
@@ -27,22 +27,26 @@ If port 8000 is occupied, start Uvicorn with `--port 8001` and set `$env:ECDAT_A
 
 ## Inputs and results
 
-- **GitHub:** enter `https://github.com/owner/repository`, optionally with a separate branch, tag or commit. The default branch is used if omitted. Public repositories only; private repositories can be downloaded by their owner and uploaded as an archive. GitHub rate limits and download errors are displayed. Submodules and Git LFS objects are not fetched.
+- **Git repositories:** enter an HTTPS clone URL, `owner/repo` for GitHub, or a configured SSH clone URL. GitHub, GitLab, Bitbucket and self-hosted Git are supported through Git. Branches, tags and commit IDs are accepted. Private repositories require host-scoped backend credentials. Submodules and Git LFS objects are detected as coverage gaps and must be supplied separately.
 - **Uploads:** drop files or a folder, use **Choose folder**, or browse for individual files. Folders and multiple files are packed into a TAR in the browser with their relative paths preserved, including Unicode and long names. The upload limit is 128 MiB including archive overhead and at most 20,000 entries. For larger folders, upload a compressed ZIP. ZIP/JAR/WAR and TAR/TAR.GZ/TGZ archives are inspected recursively in memory. Archive entries are never extracted to filesystem paths or executed.
-- **Containers:** upload a Docker `save` or OCI archive, for example `docker save -o image.tar my-image:tag`. TAR layers and gzip-compressed layers are inspected recursively, including extensionless OCI blobs. Results include all stored layers, including files removed in later layers; this is not a reconstructed runtime filesystem. Registry pulls, running containers and zstd-compressed layers are not supported.
-- **Dependency inventory:** ECDAT identifies crypto libraries declared in Python, Node.js, Go, Rust, Maven/Gradle and Docker manifests. It reports declared package versions where the manifest provides them; it does not resolve transitive dependencies or query vulnerability databases.
+- **Containers:** upload Docker-save or OCI archives. Recognized images are merged with whiteout and opaque-directory handling before scanning. Only the first image/platform is selected; links and unsupported layouts are reported as coverage gaps. Other nested archives retain recursive scanning. Registry acquisition uses optional `skopeo`; no target image or code is executed.
+- **Dependency inventory:** ECDAT identifies crypto libraries declared in Python, Node.js, Go, Rust, Maven/Gradle and Docker manifests. It reports declared package versions where the manifest provides them; npm lockfile v2/v3 installation paths provide transitive dependency relationships. Other ecosystems provide manifest inventory only; vulnerability databases are not queried.
 - **Risk context:** before a scan, set data lifetime, expected migration time, business criticality and a CRQC planning horizon. ECDAT applies Mosca's `X + Y > Z` assessment to quantum-vulnerable public-key findings and calculates a transparent 0–100 Crypto-Agility Score. These assumptions are included in the report and CBOM; they are planning inputs, not measured facts about the repository.
 - **Results:** relative paths include `!/` for archive members. Text findings include line numbers; binary findings include byte offsets. PEM/DER certificates are parsed for public-key type/size, signature hash, validity period and expiry; PEM private keys are identified for key type/size without returning their contents. Search and priority filters are available, with paginated display and full report/CBOM downloads.
 
-The matcher examines UTF-8/UTF-16 text without restricting source language or file extension. It detects 25 algorithm, key, certificate and library signature families, including modern algorithms. Binary detection searches visible byte strings, not machine instructions or decompiled code. Obfuscated, dynamically constructed, stripped, encrypted or custom crypto implementations can be missed. Comments, documentation, tests and unused library symbols can match. Confidence and priority indicate evidence to review, not a verified vulnerability or a clean security bill. Certificate validity is checked only from embedded certificate metadata; trust, revocation, host matching and live TLS are not validated.
+Text signatures run across readable files of any language. Tree-sitter adds call analysis for Python, JavaScript, TypeScript/TSX, Java, C, C++, Go and Rust, with Python import-alias resolution for supported calls. Files above 2 MiB and unsupported languages fall back to signatures; the dashboard reports analysis modes. Remediation is syntax-gated and review-only. Binary inspection combines strings with LIEF executable import/export/symbol analysis; it does not decompile arbitrary machine code. Hidden, obfuscated, stripped, encrypted or custom implementations can still be missed. Comments and unused code may produce signature evidence. Certificate/key risk follows recognized public-key algorithms; TLS discovery additionally verifies the negotiated connection using the host trust store.
+
+See [Advanced discovery and trust features](docs/advanced-features.md) for cloud KMS, TLS, registry access, signed exports, CAS history, optional draft PRs and testnet anchoring.
 
 ## Performance and coverage limits
 
-Compiled matching patterns and a two-worker background pool keep the UI responsive. Up to four jobs can be active/queued. Each scan is bounded by 20,000 visited files, 20,000 findings, 512 MiB cumulative expanded bytes, four archive levels and a 120-second cooperative inspection budget. Individual content inspection is limited to 32 MiB; archive members are limited to 128 MiB. Repository downloads have 128 MiB and 90-second limits. These are prototype limits, not a hard process isolation boundary.
+Compiled matching patterns and a two-worker background pool keep the UI responsive. Up to four jobs can be active/queued. Each scan is bounded by 20,000 visited files, 20,000 findings, 512 MiB cumulative expanded bytes, four archive levels and a 120-second cooperative inspection budget. Individual content inspection is limited to 32 MiB; archive members are limited to 128 MiB. The legacy GitHub archive endpoint has 128 MiB / 90-second limits. Git acquisition has a 512 MiB disk limit and a 120-second limit per Git operation. Registry acquisition has a 512 MiB / 120-second limit. These are prototype limits, not a hard process isolation boundary.
+
+Select **Large codebase** in the dashboard (or CLI `--scan-mode large`) for up to 100,000 visited entries, 200,000 findings and 600 seconds of inspection. Byte, nesting and acquisition limits still apply. Native parsers run in isolated workers and fall back to signatures on failure; reports record the resulting coverage gaps. CycloneDX validation uses a cached compiled schema for large inventories.
 
 `.git`, `.svn`, `node_modules`, `venv`, `.venv` and `__pycache__` directories are excluded. Symlinks, special files, encrypted ZIP entries and unsafe archive paths are skipped. **Any skipped content is reported as partial coverage**, including unreadable or corrupt archives. The first 200 warnings are included. No findings means no matching signatures in inspected content, not proof of no cryptography. Large image exports may need to be split or scanned with a purpose-built image analysis tool.
 
-Uploaded/downloaded inputs are deleted after each job. Reports and the audit chain persist under `ecdat/scan-data/` (gitignored); set `ECDAT_DATA_DIR` to change this directory. Reports have no automatic expiry. The browser remembers its last scan ID, and completed reports survive server restarts. In-flight jobs do not survive restart. Run a **single Uvicorn worker process**, since the background queue and audit lock are process-local. The audit chain detects modification within stored records; it is not externally anchored tamper-proof storage.
+Uploaded/downloaded inputs are deleted after each job. Reports and the audit chain persist under `ecdat/scan-data/` (gitignored); set `ECDAT_DATA_DIR` to change this directory. Reports have no automatic expiry. The browser remembers its last scan ID, and completed reports survive server restarts. In-flight jobs do not survive restart. Run a **single Uvicorn worker process**, since job state and the background queue are process-local; audit writes use an operating-system file lock. The audit chain detects modification within stored records; it is not externally anchored tamper-proof storage.
 
 The dashboard generates review-only diffs for unambiguous MD5/SHA-1 calls in Python, JavaScript/TypeScript, Java and OpenSSL C/C++ code. It never changes uploaded or GitHub code. Cipher migrations require design review and are deliberately not auto-patched.
 
@@ -58,6 +62,12 @@ Audit writes use an operating-system file lock. If existing audit data is unread
 | GET | `/scans/{id}` | Job state and progress |
 | GET | `/scans/{id}/result` | Completed findings and report |
 | GET | `/scans/{id}/cbom` | Completed CBOM |
+| GET | `/scans/{id}/report.pdf` | Executive PDF with coverage, risk context and prioritized findings |
+| GET | `/history` | Source-filtered scan history and application CAS |
+| GET | `/scans/{id}/signed.zip` | Signed PDF/JSON bundle |
+| GET | `/signing-key` | Public signing key and fingerprint |
+| POST | `/scans/repository` | Generic Git import with URL and ref |
+| POST | `/scans/discovery` | Opt-in TLS, registry or cloud KMS discovery |
 | GET | `/audit/verify` | Verify the persisted audit chain |
 
 Submission returns HTTP 202 and a job ID. Poll until `completed` or `failed`. API documentation is available at http://127.0.0.1:8000/docs. The old global `/cbom` and demo `/patches` routes have been replaced by per-job results; `POST /scan` now returns a background job.
@@ -68,12 +78,17 @@ Run a local directory scan with `python ecdat/cli.py path/to/project --output ec
 
 ## Validation
 
+The dashboard includes a searchable priority heatmap and an interactive file-to-asset map. Counts are evidence records, not unique cryptographic assets. The map shows observed references, not inferred runtime dependencies. It displays up to 15 matching assets and 12 files per selected asset; search narrows the asset list, and clicking a file filters the full findings table.
+
+The executive PDF includes up to 20 prioritized findings and 10 coverage warnings to keep large scans readable. Full JSON and CBOM downloads retain all scan results. PDF export requires the updated backend dependencies (`python -m pip install -r ecdat/requirements.txt`).
+
 ```powershell
+python -m pip install -r ecdat/requirements-dev.txt
 python -m unittest discover -s ecdat -p "test_*.py" -v
 cd dashboard
 npm.cmd run build
 npm.cmd run lint
-node --test src/uploads.test.mjs
+node --test src/*.test.mjs
 ```
 
 Tests use temporary report storage and a local API subprocess. They cover cross-language discovery, archives and container layers, binary offsets, UTF-16 text, limits, unsafe paths, certificate/key metadata and key redaction, profile-driven Mosca/CAS results, HTTP uploads, job isolation, CBOM export and audit verification. No network is required for the automated suite.

@@ -10,9 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from dependency_scanner import dependency_findings
 from remediation import generate_patch
+from source_analysis import syntax_calls
+from binary_analysis import symbol_findings
+from dependency_graph import dependency_graph
+from container_layers import merged_files
 
 RULES = [
  ('MD5', r'md5(?:CryptoServiceProvider)?', 'high', 'Avoid MD5 for security decisions; review use and migrate to SHA-256 or stronger.'),
@@ -32,6 +37,9 @@ RULES = [
  ('Ed25519', r'ed25519', 'review', 'Modern classical signature; review post-quantum requirements.'),
  ('ML-KEM', r'(?:ml[-_]?kem(?:[-_]?\d+)?|kyber\d*)', 'info', 'Confirm standardized ML-KEM implementation and parameter set.'),
  ('ML-DSA', r'(?:ml[-_]?dsa(?:[-_]?\d+)?|dilithium\d*)', 'info', 'Confirm standardized ML-DSA implementation and parameter set.'),
+ ('SLH-DSA', r'(?:slh[-_]?dsa|sphincs(?:plus)?)', 'info', 'Confirm standardized SLH-DSA implementation and parameter set.'),
+ ('DSA', r'dsa', 'review', 'Plan a migration to ML-DSA or SLH-DSA signatures.'),
+ ('DH', r'(?:diffie[-_]?hellman|dh)', 'review', 'Plan hybrid ML-KEM key establishment.'),
  ('bcrypt', r'bcrypt', 'info', 'Review password hashing work factor.'),
  ('scrypt', r'scrypt', 'info', 'Review password hashing memory and work factors.'),
  ('Argon2', r'argon2(?:id|i|d)?', 'info', 'Review password hashing parameters; prefer Argon2id.'),
@@ -65,17 +73,25 @@ class ScanLimit(ValueError):
     pass
 
 class Scanner:
-    def __init__(self, progress=None):
+    def __init__(self, progress=None, mode='standard'):
+        if mode not in {'standard', 'large'}:
+            raise ValueError('Scan mode must be standard or large.')
+        self.mode = mode
+        self.max_findings = MAX_FINDINGS if mode == 'standard' else 200000
+        self.max_files = MAX_FILES if mode == 'standard' else 100000
+        self.max_seconds = MAX_SECONDS if mode == 'standard' else 600
         self.findings, self.warnings, self.patches = [], [], []
         self.stats = dict(files_scanned=0, files_skipped=0, archives_opened=0, bytes_scanned=0, text_files=0, binary_files=0)
         self.visited = self.expanded = 0
         self.started = time.monotonic()
         self.progress = progress or (lambda _: None)
+        self.coverage = {}
+        self.dependency_graphs = []
 
     def check(self):
-        if time.monotonic() - self.started > MAX_SECONDS:
+        if time.monotonic() - self.started > self.max_seconds:
             raise ScanLimit('Scan time limit reached; coverage is partial.')
-        if self.visited >= MAX_FILES or self.expanded >= MAX_TOTAL or len(self.findings) >= MAX_FINDINGS:
+        if self.visited >= self.max_files or self.expanded >= MAX_TOTAL or len(self.findings) >= self.max_findings:
             raise ScanLimit('Scan resource limit reached; coverage is partial.')
 
     def skip(self, name, reason):
@@ -109,6 +125,11 @@ class Scanner:
 
     def content(self, data, name, depth=0):
         self.check()
+        if PurePosixPath(name).name == '.gitmodules':
+            self.skip(name, 'Submodule configuration found; submodule repositories must be scanned separately.')
+        if data.startswith(b'version https://git-lfs.github.com/spec/v1'):
+            self.skip(name, 'Git LFS pointer found; upload the actual object to inspect it.')
+            return
         if data.startswith((b'\x28\xb5\x2f\xfd', b'7z\xbc\xaf\x27\x1c', b'Rar!')):
             self.skip(name, 'unsupported compressed format (zstd, 7z or RAR); upload ZIP or TAR.GZ instead')
             return
@@ -119,6 +140,21 @@ class Scanner:
                 self.skip(name, 'archive nesting limit')
                 return
             self.stats['archives_opened'] += 1
+            if is_tar and not is_zip:
+                try:
+                    merged = merged_files(data, max_bytes=max(0, MAX_TOTAL - self.expanded), max_entries=self.max_files - self.visited)
+                    if merged is not None:
+                        files, warnings = merged
+                        for warning in warnings:
+                            self.skip(name, warning)
+                        self.coverage['merged container filesystem'] = self.coverage.get('merged container filesystem', 0) + 1
+                        self.findings.append(dict(file=name, line=None, offset=None, pattern='Container metadata', call='image manifest', evidence='Merged container filesystem', kind='container', confidence='high', severity='info', asset_type='container', recommendation='Review final filesystem and separately audit historical image layers.'))
+                        for path, payload in files.items():
+                            self.read_member(io.BytesIO(payload), len(payload), name + '!/rootfs/' + path, depth + 1)
+                        return
+                except (ValueError, KeyError, TypeError, tarfile.TarError) as exc:
+                    self.skip(name, 'Container merge unavailable: ' + str(exc)[:100])
+                    return
             try:
                 if is_zip:
                     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -165,21 +201,33 @@ class Scanner:
         self.stats['binary_files' if binary else 'text_files'] += 1
         self.stats['bytes_scanned'] += len(data)
         structured_patterns = self.crypto_metadata(data, name, binary)
+        if binary:
+            symbols, warning = symbol_findings(data, name, RULES)
+            self.findings.extend(symbols[:max(0, self.max_findings - len(self.findings))])
+            if warning:
+                self.skip(name, warning)
         direct_matches = self.source_call_findings(name, text, binary)
         if not binary:
-            patch = generate_patch(name, text)
+            patch = generate_patch(name, text, analysis=self._source_analysis)
             if patch:
                 self.patches.append(patch)
         if not binary:
-            self.findings.extend(dependency_findings(name, text))
+            try:
+                self.findings.extend(dependency_findings(name, text)[:max(0, self.max_findings - len(self.findings))])
+            except (ValueError, TypeError, AttributeError, KeyError):
+                self.skip(name, 'Dependency manifest could not be parsed; signature scanning remains active.')
+            graph = dependency_graph(name, text)
+            if graph:
+                self.dependency_graphs.append(graph)
         seen, line, previous = set(), 1, 0
         for match in SIGNATURE.finditer(text):
             self.check()
             algorithm, _, severity, recommendation = RULES[int(match.lastgroup[1:])]
             if algorithm in structured_patterns:
                 continue
-            line = text.count('\n', 0, match.start()) + 1
-            previous = match.start()
+            if not binary:
+                line += text.count('\n', previous, match.start())
+                previous = match.start()
             location = match.start() if binary else line
             key = algorithm, location
             if key in seen or key in direct_matches:
@@ -193,13 +241,19 @@ class Scanner:
     def source_call_findings(self, name, text, binary):
         if binary:
             return set()
-        suffix = PurePosixPath(name).suffix.lower()
-        if suffix not in {'.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.java', '.go', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp'}:
-            return set()
+        calls, coverage = syntax_calls(name, text)
+        self._source_analysis = calls, coverage
+        self.coverage[coverage] = self.coverage.get(coverage, 0) + 1
+        if 'failed or timed out' in coverage or 'parser unavailable' in coverage:
+            self.skip(name, coverage)
         matches = set()
-        for algorithm, pattern in SOURCE_CALLS:
-            for match in pattern.finditer(text):
-                line = text.count('\n', 0, match.start()) + 1
+        for call in calls:
+            for algorithm, pattern in SOURCE_CALLS:
+                match = pattern.search(call['resolved'])
+                if not match or not re.fullmatch(r'[\w.\s]*', call['resolved'][:match.start()]):
+                    continue
+                self.check()
+                line = call['line']
                 key = (algorithm, line)
                 if key in matches:
                     continue
@@ -210,18 +264,17 @@ class Scanner:
                     'file': name, 'line': line, 'offset': None, 'pattern': algorithm,
                     'call': match.group(), 'evidence': match.group(), 'kind': 'source-call',
                     'confidence': 'high', 'severity': severity, 'recommendation': recommendation,
-                    'asset_type': 'algorithm', 'metadata': {'detection': 'language-aware call pattern'},
+                    'asset_type': 'algorithm', 'metadata': {'detection': coverage},
                 })
         return matches
 
     def crypto_metadata(self, data, name, binary):
         structured_patterns = set()
-        if binary:
-            return structured_patterns
         certificate_blocks = CERTIFICATE_BLOCK.findall(data)
         if not certificate_blocks and name.lower().endswith(('.cer', '.crt', '.der')):
             certificate_blocks = [data]
         for block in certificate_blocks:
+            self.check()
             try:
                 certificate = x509.load_pem_x509_certificate(block) if block.startswith(b'-----') else x509.load_der_x509_certificate(block)
                 public_key = certificate.public_key()
@@ -243,9 +296,10 @@ class Scanner:
                 )
                 self.findings.append(finding)
                 structured_patterns.add('Certificate')
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, UnsupportedAlgorithm):
                 self.skip(name, 'certificate data could not be parsed')
         for block in PRIVATE_KEY_BLOCK.findall(data):
+            self.check()
             try:
                 key = serialization.load_pem_private_key(block, password=None)
                 key_size = getattr(key, 'key_size', None)
@@ -256,7 +310,7 @@ class Scanner:
                     {'key_algorithm': key_algorithm, **({'key_size': key_size} if key_size else {}), 'encrypted': False},
                 ))
                 structured_patterns.add('Private key')
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, UnsupportedAlgorithm):
                 self.findings.append(self.structured_finding(
                     name, data, block, 'Private key', 'key-material', 'high',
                     'Review embedded private key material; remove and rotate if exposed.', {'encrypted_or_unreadable': True},
@@ -307,18 +361,27 @@ class Scanner:
                         self.skip(name, 'unreadable file')
         except ScanLimit as exc:
             self.skip('Scan', str(exc))
+        return self.report()
+
+    def file(self, path):
+        path = Path(path)
+        try:
+            with path.open('rb') as stream:
+                self.read_member(stream, path.stat().st_size, path.name, 0)
+        except ScanLimit as exc:
+            self.skip('Scan', str(exc))
+        return self.report()
+
+    def report(self):
         self.findings.sort(key=lambda f: (f['file'], f['line'] or 0, f['offset'] or 0, f['pattern']))
         dependency_count = sum(finding.get('kind') == 'dependency' for finding in self.findings)
         container_count = sum(finding.get('kind') == 'container' for finding in self.findings)
         return dict(findings=self.findings, patches=self.patches, stats={**self.stats, 'duration_seconds': round(time.monotonic() - self.started, 3), 'dependencies_found': dependency_count, 'container_manifests_found': container_count},
-                    warnings=self.warnings, partial=bool(self.stats['files_skipped']))
+                    warnings=self.warnings, partial=bool(self.stats['files_skipped']), coverage=self.coverage, dependency_graphs=self.dependency_graphs,
+                    limits={'mode': self.mode, 'files': self.max_files, 'findings': self.max_findings, 'seconds': self.max_seconds, 'expanded_bytes': MAX_TOTAL})
 
 def scan_directory(path):
     return Scanner().directory(path)['findings']
 
 def scan_file(filepath):
-    path = Path(filepath)
-    scanner = Scanner()
-    with path.open('rb') as stream:
-        scanner.read_member(stream, path.stat().st_size, path.name, 0)
-    return scanner.findings
+    return Scanner().file(filepath)['findings']

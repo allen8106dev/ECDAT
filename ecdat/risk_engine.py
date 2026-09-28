@@ -53,6 +53,21 @@ def crypto_agility_score(risk_score, criticality, migration_effort):
 
 def classify_finding(finding):
     name = finding.get("pattern", "UNKNOWN")
+    metadata = finding.get('metadata', {})
+    key_algorithm = str(metadata.get('public_key_algorithm', metadata.get('key_algorithm', ''))).upper()
+    classical_key = any(key in key_algorithm for key in ('RSA', 'ELLIPTICCURVE', 'ECDSA', 'ECDH', 'ED25519', 'ED448', 'X25519', 'X448', 'DSA', 'DH'))
+    classical_key = classical_key or key_algorithm in {'EC', 'EC-HSM', 'KEYTYPE.EC', 'KEYTYPE.EC_HSM'} or key_algorithm.startswith('EC_SIGN_')
+    if any(key in key_algorithm for key in ('ML_DSA', 'ML-DSA', 'ML_KEM', 'ML-KEM', 'SLH_DSA', 'SLH-DSA')):
+        return 'post-quantum', False, 1, 'Validate standardized parameters and protocol compatibility.'
+    if name in {'Certificate', 'Private key', 'Managed key'} and classical_key:
+        recommendation = PQC_RECOMMENDATIONS['RSA' if 'RSA' in key_algorithm else 'ECDSA']
+        if name == 'Private key':
+            recommendation = 'Remove and rotate exposed private keys. ' + recommendation
+        size = metadata.get('public_key_size', metadata.get('key_size', 0))
+        risk = 10 if metadata.get('signature_algorithm') in {'md5', 'sha1'} or ('RSA' in key_algorithm and 0 < size < 2048) else 7
+        return 'classical-public-key', True, max(risk, 9 if name == 'Private key' else 0), recommendation
+    if finding.get('kind') in {'dependency', 'container'}:
+        return 'inventory-needs-review', False, 4, finding.get('recommendation', '')
     if name in QUANTUM_VULNERABLE:
         return "classical-public-key", True, 7, PQC_RECOMMENDATIONS.get(name, finding.get("recommendation", ""))
     if name in WEAK_ALGORITHMS:
@@ -61,7 +76,7 @@ def classify_finding(finding):
         return "key-material", False, 9, "Move private keys out of source or image layers, rotate exposed keys, and use managed secret storage."
     if name == "Certificate":
         return "certificate", False, 4, finding.get("recommendation", "")
-    if name in {"ML-KEM", "ML-DSA"}:
+    if name in {"ML-KEM", "ML-DSA", "SLH-DSA"}:
         return "post-quantum", False, 1, finding.get("recommendation", "")
     return "symmetric-or-hash", False, 2, finding.get("recommendation", "")
 
@@ -90,10 +105,16 @@ def assess_findings(findings, profile=None):
         finding["recommendation"] = recommendation
         assessed.append(finding)
     scores = [finding["cryptoAgilityScore"] for finding in assessed]
+    unique_scores = {}
+    for finding in assessed:
+        pair = finding.get('file'), finding.get('pattern')
+        unique_scores[pair] = min(unique_scores.get(pair, 100), finding['cryptoAgilityScore'])
     return assessed, {
         "profile": profile,
         "assets_assessed": len(assessed),
         "quantum_vulnerable_assets": sum(finding["quantum_vulnerable"] for finding in assessed),
         "at_risk_now": sum(finding["quantum_vulnerable"] and finding["riskAssessment"]["at_risk_now"] for finding in assessed),
         "average_crypto_agility_score": round(sum(scores) / len(scores), 1) if scores else None,
+        "application_crypto_agility_score": round(sum(unique_scores.values()) / len(unique_scores), 1) if unique_scores else None,
+        "unique_file_asset_pairs": len(unique_scores),
     }

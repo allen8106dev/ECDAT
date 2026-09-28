@@ -1,6 +1,7 @@
 """Dependency manifest and container metadata discovery without executing content."""
 import json
 import re
+import tomllib
 from pathlib import PurePosixPath
 
 
@@ -12,7 +13,7 @@ CRYPTO_LIBRARIES = {
     "bcprov-jdk": "Bouncy Castle", "libsodium": "libsodium", "ring": "Rust ring",
     "rustls": "rustls", "golang.org/x/crypto": "Go crypto extensions",
 }
-MANIFEST_NAMES = {"requirements.txt", "pyproject.toml", "package.json", "package-lock.json", "go.mod", "cargo.toml", "pom.xml", "build.gradle", "build.gradle.kts", "dockerfile", "manifest.json", "index.json", "oci-layout"}
+MANIFEST_NAMES = {"requirements.txt", "pyproject.toml", "package.json", "package-lock.json", "go.mod", "cargo.toml", "cargo.lock", "pom.xml", "build.gradle", "build.gradle.kts", "dockerfile", "manifest.json", "index.json", "oci-layout"}
 
 
 def dependency_findings(name, text):
@@ -46,12 +47,42 @@ def dependency_findings(name, text):
 
 
 def _packages(leaf, text):
+    if leaf in {'pyproject.toml', 'cargo.toml', 'cargo.lock'}:
+        try:
+            data = tomllib.loads(text)
+        except ValueError:
+            return []
+        if leaf == 'pyproject.toml':
+            dependencies = list(data.get('project', {}).get('dependencies', []))
+            for group in data.get('project', {}).get('optional-dependencies', {}).values():
+                dependencies.extend(group)
+            values = []
+            for value in dependencies:
+                match = re.match(r'([\w.-]+)(.*)', value)
+                if match:
+                    values.append((match[1], match[2], _line_for(text, value)))
+            values.extend((name, str(value), _line_for(text, name)) for name, value in data.get('tool', {}).get('poetry', {}).get('dependencies', {}).items())
+            return values
+        if leaf == 'cargo.lock':
+            return [(item['name'], item.get('version', ''), _line_for(text, 'name = "' + item['name'] + '"')) for item in data.get('package', [])]
+        values = []
+        for section in ('dependencies', 'dev-dependencies', 'build-dependencies'):
+            for name, value in data.get(section, {}).items():
+                values.append((name, value.get('version', '') if isinstance(value, dict) else str(value), _line_for(text, name)))
+        return values
     if leaf in {"package.json", "package-lock.json"}:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
             return []
         values = []
+        if leaf == 'package-lock.json' and 'packages' in data:
+            for location, entry in data['packages'].items():
+                if not location:
+                    continue
+                package = entry.get('name') or location.rsplit('node_modules/', 1)[-1]
+                values.append((package, entry.get('version', ''), _line_for(text, '"' + location + '"')))
+            return values
         for section in ("dependencies", "devDependencies", "optionalDependencies"):
             for package, version in data.get(section, {}).items():
                 values.append((package, str(version), _line_for(text, f'"{package}"')))

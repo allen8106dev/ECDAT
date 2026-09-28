@@ -2,3 +2,15 @@ pycryptodome
 cryptography
 fastapi
 uvicorn
+reportlab>=4.4,<5
+fastjsonschema>=2.21,<3
+tree-sitter==0.25.2
+tree-sitter-python
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-java
+tree-sitter-c
+tree-sitter-cpp
+tree-sitter-go
+tree-sitter-rust
+lief>=1,<2

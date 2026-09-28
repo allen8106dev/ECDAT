@@ -1,0 +1,6 @@
+-r requirements.txt
+boto3>=1.35,<2
+azure-identity>=1.19,<2
+azure-keyvault-keys>=4.10,<5
+google-cloud-kms>=3,<4
+web3>=7,<8
