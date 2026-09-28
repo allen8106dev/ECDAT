@@ -22,13 +22,13 @@ def build_cbom(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             "type": "cryptographic-asset",
             "name": finding.get("pattern", "UNKNOWN"),
             "cryptoProperties": {
-                "assetType": "algorithm"
+                "assetType": finding.get("asset_type", "algorithm")
             },
             "evidence": {
                 "occurrences": [
                     {
                         "location": finding.get("file", ""),
-                        "line": finding.get("line", 0)
+                        **({"line": finding["line"]} if finding.get("line") else {})
                     }
                 ]
             },
@@ -37,7 +37,9 @@ def build_cbom(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
                     "name": "recommendation",
                     "value": finding.get("recommendation", "")
                 }
-            ]
+            ] + [{"name": "ecdat:" + key, "value": json.dumps(finding[key], sort_keys=True) if isinstance(finding[key], (dict, list)) else str(finding[key])}
+                 for key in ("kind", "confidence", "severity", "offset", "evidence", "classification", "quantum_vulnerable", "riskAssessment", "cryptoAgilityScore", "metadata")
+                 if finding.get(key) is not None]
         }
         components.append(component)
 

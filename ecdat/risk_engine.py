@@ -1,118 +1,99 @@
-"""
-risk_engine.py - Mosca quantum risk theorem evaluation and Crypto Agility Score (CAS) enrichment.
-"""
+"""Risk classification, Mosca assessment and crypto-agility scoring."""
+from copy import deepcopy
 
-import json
-from pathlib import Path
-from typing import Any, Dict, List, Union
 
-# Demo placeholder parameters for legacy and vulnerable cryptographic algorithms
-DEMO_PARAMS: Dict[str, Dict[str, int]] = {
-    "RSA": {"data_lifetime": 15, "migration_time": 3, "criticality": 9, "migration_effort": 7},
-    "ECDSA": {"data_lifetime": 15, "migration_time": 3, "criticality": 8, "migration_effort": 6},
-    "MD5": {"data_lifetime": 5, "migration_time": 1, "criticality": 5, "migration_effort": 2},
-    "SHA1": {"data_lifetime": 5, "migration_time": 1, "criticality": 5, "migration_effort": 2},
-    "DES": {"data_lifetime": 10, "migration_time": 2, "criticality": 7, "migration_effort": 4},
+DEFAULT_PROFILE = {
+    "data_lifetime_years": 10,
+    "migration_time_years": 3,
+    "criticality": 5,
+    "crqc_arrival_years": 10,
+}
+
+QUANTUM_VULNERABLE = {"RSA", "ECDSA", "ECDH", "Ed25519", "DSA", "DH"}
+WEAK_ALGORITHMS = {"MD5", "SHA1", "DES", "3DES", "RC4", "ECB"}
+PQC_RECOMMENDATIONS = {
+    "RSA": "For encryption, plan a ML-KEM (FIPS 203) hybrid migration. For signatures, plan ML-DSA (FIPS 204) or SLH-DSA (FIPS 205), after validating protocol compatibility.",
+    "ECDSA": "Plan ML-DSA (FIPS 204) or a hybrid signature migration after validating protocol compatibility.",
+    "ECDH": "Plan an ML-KEM (FIPS 203) hybrid key-establishment migration after validating protocol compatibility.",
+    "Ed25519": "Plan a post-quantum signature migration such as ML-DSA (FIPS 204), retaining a hybrid transition where needed.",
 }
 
 
-def mosca_risk(data_lifetime_years, migration_time_years, crqc_arrival_years=10):
-    total_exposure = data_lifetime_years + migration_time_years
-    at_risk = total_exposure > crqc_arrival_years
+def normalize_profile(profile=None):
+    values = {**DEFAULT_PROFILE, **(profile or {})}
+    normalized = {}
+    for name, default in DEFAULT_PROFILE.items():
+        try:
+            value = int(values.get(name, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a whole number") from exc
+        if name == "criticality" and not 1 <= value <= 10:
+            raise ValueError("criticality must be between 1 and 10")
+        if name != "criticality" and not 0 <= value <= 100:
+            raise ValueError(f"{name} must be between 0 and 100")
+        normalized[name] = value
+    return normalized
+
+
+def mosca_risk(data_lifetime_years, migration_time_years, crqc_arrival_years):
+    exposure = data_lifetime_years + migration_time_years
     return {
-        "X_data_lifetime": data_lifetime_years,
-        "Y_migration_time": migration_time_years,
-        "Z_crqc_estimate": crqc_arrival_years,
-        "at_risk_now": at_risk,
-        "urgency_score": round(total_exposure / crqc_arrival_years, 2)
+        "data_lifetime_years": data_lifetime_years,
+        "migration_time_years": migration_time_years,
+        "crqc_arrival_years": crqc_arrival_years,
+        "at_risk_now": exposure > crqc_arrival_years,
+        "urgency_score": round(exposure / crqc_arrival_years, 2) if crqc_arrival_years else None,
     }
 
 
-def crypto_agility_score(risk_score, criticality_weight, migration_effort):
-    raw_penalty = (risk_score * 0.5) + (criticality_weight * 0.3) + (migration_effort * 0.2)
-    readiness = max(0, 100 - (raw_penalty * 10))
-    return round(readiness, 1)
+def crypto_agility_score(risk_score, criticality, migration_effort):
+    penalty = risk_score * 0.5 + criticality * 0.3 + migration_effort * 0.2
+    return round(max(0, 100 - penalty * 10), 1)
 
 
-def enrich_cbom(cbom_json: Union[str, Path, Dict[str, Any], None] = None) -> Dict[str, Any]:
-    """
-    Enriches CBOM components with Mosca's quantum risk metrics and Crypto Agility Scores (CAS).
-    Saves the enriched structure to cbom_enriched.json.
-    """
-    if cbom_json is None:
-        source_path = Path(__file__).parent / "cbom_output.json"
-        with open(source_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    elif isinstance(cbom_json, (str, Path)):
-        source_path = Path(cbom_json)
-        if not source_path.exists():
-            source_path = Path(__file__).parent / source_path.name
-        with open(source_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    elif isinstance(cbom_json, dict):
-        data = cbom_json
-    else:
-        raise ValueError(f"Unsupported cbom_json input: {type(cbom_json)}")
+def classify_finding(finding):
+    name = finding.get("pattern", "UNKNOWN")
+    if name in QUANTUM_VULNERABLE:
+        return "classical-public-key", True, 7, PQC_RECOMMENDATIONS.get(name, finding.get("recommendation", ""))
+    if name in WEAK_ALGORITHMS:
+        return "legacy-or-weak", False, 10, finding.get("recommendation", "")
+    if name == "Private key":
+        return "key-material", False, 9, "Move private keys out of source or image layers, rotate exposed keys, and use managed secret storage."
+    if name == "Certificate":
+        return "certificate", False, 4, finding.get("recommendation", "")
+    if name in {"ML-KEM", "ML-DSA"}:
+        return "post-quantum", False, 1, finding.get("recommendation", "")
+    return "symmetric-or-hash", False, 2, finding.get("recommendation", "")
 
-    components: List[Dict[str, Any]] = data.get("components", [])
 
-    for component in components:
-        algo_name = component.get("name", "").upper()
-        params = DEMO_PARAMS.get(
-            algo_name,
-            {"data_lifetime": 5, "migration_time": 2, "criticality": 5, "migration_effort": 3}
+def assess_findings(findings, profile=None):
+    profile = normalize_profile(profile)
+    assessed = []
+    for original in findings:
+        finding = deepcopy(original)
+        asset_type, quantum_vulnerable, base_risk, recommendation = classify_finding(finding)
+        metadata = finding.get("metadata", {})
+        if metadata.get("expired"):
+            base_risk = 10
+        mosca = mosca_risk(
+            profile["data_lifetime_years"],
+            profile["migration_time_years"],
+            profile["crqc_arrival_years"],
         )
-
-        # 1. Compute Mosca's theorem risk metrics
-        risk_data = mosca_risk(
-            data_lifetime_years=params["data_lifetime"],
-            migration_time_years=params["migration_time"]
-        )
-
-        # 2. Compute Crypto Agility Score (CAS)
-        # risk_score = urgency_score * 5, capped at 10
-        risk_score = min(10.0, risk_data["urgency_score"] * 5)
-        cas = crypto_agility_score(
-            risk_score=risk_score,
-            criticality_weight=params["criticality"],
-            migration_effort=params["migration_effort"]
-        )
-
-        # 3. Add enriched risk keys
-        component["riskAssessment"] = risk_data
-        component["cryptoAgilityScore"] = cas
-
-    # Save enriched result to cbom_enriched.json in project root
-    output_path = Path(__file__).parent / "cbom_enriched.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-    return data
-
-
-if __name__ == "__main__":
-    cbom_file = Path(__file__).parent / "cbom_output.json"
-    if not cbom_file.exists():
-        cbom_file = Path("./cbom_output.json")
-
-    enriched_data = enrich_cbom(str(cbom_file))
-    components = enriched_data.get("components", [])
-
-    print("=" * 70)
-    print("           ECDAT Cryptographic Risk Assessment Summary")
-    print("=" * 70)
-    header = f"{'Algorithm':<14} | {'At Risk Now':<13} | {'Urgency Score':<15} | {'CAS Score':<10}"
-    print(header)
-    print("-" * 70)
-
-    for comp in components:
-        name = comp.get("name", "N/A")
-        risk = comp.get("riskAssessment", {})
-        at_risk = str(risk.get("at_risk_now", "N/A"))
-        urgency = f"{risk.get('urgency_score', 0.0):.2f}"
-        cas = f"{comp.get('cryptoAgilityScore', 0.0):.1f}"
-        print(f"{name:<14} | {at_risk:<13} | {urgency:<15} | {cas:<10}")
-
-    print("=" * 70)
-    print(f"Enriched CBOM saved to: {Path(__file__).parent / 'cbom_enriched.json'}")
-
+        if quantum_vulnerable and mosca["at_risk_now"]:
+            base_risk = min(10, base_risk + 2)
+        effort = 8 if quantum_vulnerable else 5 if asset_type in {"legacy-or-weak", "key-material"} else 3
+        finding["classification"] = asset_type
+        finding["quantum_vulnerable"] = quantum_vulnerable
+        finding["riskAssessment"] = {**mosca, "risk_score": base_risk}
+        finding["cryptoAgilityScore"] = crypto_agility_score(base_risk, profile["criticality"], effort)
+        finding["recommendation"] = recommendation
+        assessed.append(finding)
+    scores = [finding["cryptoAgilityScore"] for finding in assessed]
+    return assessed, {
+        "profile": profile,
+        "assets_assessed": len(assessed),
+        "quantum_vulnerable_assets": sum(finding["quantum_vulnerable"] for finding in assessed),
+        "at_risk_now": sum(finding["quantum_vulnerable"] and finding["riskAssessment"]["at_risk_now"] for finding in assessed),
+        "average_crypto_agility_score": round(sum(scores) / len(scores), 1) if scores else None,
+    }
