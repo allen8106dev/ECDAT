@@ -11,6 +11,8 @@ from pathlib import Path, PurePosixPath
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
+from dependency_scanner import dependency_findings
+from remediation import generate_patch
 
 RULES = [
  ('MD5', r'md5(?:CryptoServiceProvider)?', 'high', 'Avoid MD5 for security decisions; review use and migrate to SHA-256 or stronger.'),
@@ -49,13 +51,22 @@ MAX_FINDINGS = 20000
 MAX_SECONDS = 120
 CERTIFICATE_BLOCK = re.compile(br"-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----")
 PRIVATE_KEY_BLOCK = re.compile(br"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
+SOURCE_CALLS = [
+    ("MD5", re.compile(r"\bhashlib\.md5\s*\(|\bcreateHash\s*\(\s*['\"]md5|\bMessageDigest\.getInstance\s*\(\s*['\"]MD5|\bEVP_md5\s*\(", re.I)),
+    ("SHA1", re.compile(r"\bhashlib\.sha1\s*\(|\bcreateHash\s*\(\s*['\"]sha1|\bMessageDigest\.getInstance\s*\(\s*['\"]SHA-?1|\bEVP_sha1\s*\(", re.I)),
+    ("DES", re.compile(r"\bDES\.new\s*\(|\bCipher\.getInstance\s*\(\s*['\"]DES|\bDES_set_key", re.I)),
+    ("3DES", re.compile(r"\bDES3\.new\s*\(|\bCipher\.getInstance\s*\(\s*['\"](?:DESede|3DES)", re.I)),
+    ("RC4", re.compile(r"\bARC4\.new\s*\(|\bCipher\.getInstance\s*\(\s*['\"]RC4", re.I)),
+    ("RSA", re.compile(r"\bRSA\.generate\s*\(|\bRSA_generate_key|\bKeyPairGenerator\.getInstance\s*\(\s*['\"]RSA", re.I)),
+    ("ECDSA", re.compile(r"\bECDSA\.(?:generate|sign)|\bSignature\.getInstance\s*\(\s*['\"](?:SHA\d*withECDSA|ECDSA)", re.I)),
+]
 
 class ScanLimit(ValueError):
     pass
 
 class Scanner:
     def __init__(self, progress=None):
-        self.findings, self.warnings = [], []
+        self.findings, self.warnings, self.patches = [], [], []
         self.stats = dict(files_scanned=0, files_skipped=0, archives_opened=0, bytes_scanned=0, text_files=0, binary_files=0)
         self.visited = self.expanded = 0
         self.started = time.monotonic()
@@ -154,23 +165,54 @@ class Scanner:
         self.stats['binary_files' if binary else 'text_files'] += 1
         self.stats['bytes_scanned'] += len(data)
         structured_patterns = self.crypto_metadata(data, name, binary)
+        direct_matches = self.source_call_findings(name, text, binary)
+        if not binary:
+            patch = generate_patch(name, text)
+            if patch:
+                self.patches.append(patch)
+        if not binary:
+            self.findings.extend(dependency_findings(name, text))
         seen, line, previous = set(), 1, 0
         for match in SIGNATURE.finditer(text):
             self.check()
             algorithm, _, severity, recommendation = RULES[int(match.lastgroup[1:])]
             if algorithm in structured_patterns:
                 continue
-            line += text.count('\n', previous, match.start())
+            line = text.count('\n', 0, match.start()) + 1
             previous = match.start()
             location = match.start() if binary else line
             key = algorithm, location
-            if key in seen:
+            if key in seen or key in direct_matches:
                 continue
             seen.add(key)
             self.findings.append(dict(file=name, line=None if binary else line, offset=match.start() if binary else None,
                 pattern=algorithm, call=match.group(), evidence=match.group(), kind='binary' if binary else 'text',
                 confidence='low' if binary else 'medium', severity=severity, recommendation=recommendation))
         self.progress(dict(self.stats))
+
+    def source_call_findings(self, name, text, binary):
+        if binary:
+            return set()
+        suffix = PurePosixPath(name).suffix.lower()
+        if suffix not in {'.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.java', '.go', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp'}:
+            return set()
+        matches = set()
+        for algorithm, pattern in SOURCE_CALLS:
+            for match in pattern.finditer(text):
+                line = text.count('\n', 0, match.start()) + 1
+                key = (algorithm, line)
+                if key in matches:
+                    continue
+                matches.add(key)
+                severity = next(rule[2] for rule in RULES if rule[0] == algorithm)
+                recommendation = RECOMMENDATIONS[algorithm]
+                self.findings.append({
+                    'file': name, 'line': line, 'offset': None, 'pattern': algorithm,
+                    'call': match.group(), 'evidence': match.group(), 'kind': 'source-call',
+                    'confidence': 'high', 'severity': severity, 'recommendation': recommendation,
+                    'asset_type': 'algorithm', 'metadata': {'detection': 'language-aware call pattern'},
+                })
+        return matches
 
     def crypto_metadata(self, data, name, binary):
         structured_patterns = set()
@@ -266,7 +308,9 @@ class Scanner:
         except ScanLimit as exc:
             self.skip('Scan', str(exc))
         self.findings.sort(key=lambda f: (f['file'], f['line'] or 0, f['offset'] or 0, f['pattern']))
-        return dict(findings=self.findings, stats={**self.stats, 'duration_seconds': round(time.monotonic() - self.started, 3)},
+        dependency_count = sum(finding.get('kind') == 'dependency' for finding in self.findings)
+        container_count = sum(finding.get('kind') == 'container' for finding in self.findings)
+        return dict(findings=self.findings, patches=self.patches, stats={**self.stats, 'duration_seconds': round(time.monotonic() - self.started, 3), 'dependencies_found': dependency_count, 'container_manifests_found': container_count},
                     warnings=self.warnings, partial=bool(self.stats['files_skipped']))
 
 def scan_directory(path):

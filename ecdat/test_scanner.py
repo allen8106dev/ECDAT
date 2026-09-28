@@ -61,6 +61,22 @@ class DiscoveryTests(unittest.TestCase):
         report = self.scan({'Crypto.cs': b'new MD5CryptoServiceProvider(); new AesGcm(key); SHA256Managed.Create();'})
         self.assertEqual({f['pattern'] for f in report['findings']}, {'MD5', 'AES', 'SHA256'})
 
+    def test_code_aware_calls_dependencies_and_patches(self):
+        report = self.scan({
+            'src/hash.py': b'import hashlib\nhashlib.md5(payload)\n',
+            'requirements.txt': b'cryptography==44.0.0\npycryptodome>=3.20\n',
+            'package.json': b'{"dependencies":{"crypto-js":"4.2.0"}}',
+            'Dockerfile': b'FROM alpine\nRUN apk add openssl\n',
+        })
+        md5 = next(finding for finding in report['findings'] if finding['pattern'] == 'MD5')
+        self.assertEqual(md5['kind'], 'source-call')
+        self.assertEqual(md5['confidence'], 'high')
+        dependencies = [finding for finding in report['findings'] if finding['kind'] == 'dependency']
+        self.assertEqual({finding['metadata']['package'] for finding in dependencies}, {'cryptography', 'pycryptodome', 'crypto-js', 'openssl'})
+        self.assertEqual(report['stats']['dependencies_found'], 4)
+        self.assertEqual(report['patches'][0]['file'], 'src/hash.py')
+        self.assertIn('hashlib.sha256(', '\n'.join(report['patches'][0]['diff']))
+
     def test_unsupported_compression_reports_partial(self):
         report = self.scan({'layer': b'\x28\xb5\x2f\xfdcompressed'})
         self.assertTrue(report['partial'])
@@ -78,6 +94,12 @@ class DiscoveryTests(unittest.TestCase):
         report = self.scan({'container.zip': zip_bytes({'layer.tar': layer.getvalue()})})
         self.assertEqual(report['stats']['archives_opened'], 2)
         self.assertIn('container.zip!/layer.tar!/usr/lib/crypto.so', report['findings'][0]['file'])
+
+    def test_oci_manifest_is_inventory_evidence(self):
+        report = self.scan({'image.tar': zip_bytes({'manifest.json': b'[{"Config":"config.json","Layers":[]} ]'})})
+        finding = next(finding for finding in report['findings'] if finding['pattern'] == 'Container metadata')
+        self.assertEqual(finding['kind'], 'container')
+        self.assertEqual(report['stats']['container_manifests_found'], 1)
 
     def test_unsafe_paths_and_exclusions(self):
         report = self.scan({'repo.zip': zip_bytes({'../escape': b'MD5', '/absolute': b'MD5', 'node_modules/dep.js': b'MD5', 'ok.py': b'SHA256'})})
@@ -167,6 +189,8 @@ class APITests(unittest.TestCase):
         b = self.request('/scans/upload?filename=modern.rs', b'SHA256')
         first, second = self.finish(a), self.finish(b)
         self.assertEqual([f['pattern'] for f in first['findings']], ['MD5'])
+        self.assertEqual(first['patches'][0]['file'], 'repo.zip!/src/index.js')
+        self.assertTrue(first['patches'][0]['review_required'])
         self.assertEqual([f['pattern'] for f in second['findings']], ['SHA256'])
         self.assertEqual(self.request('/scans/' + a['id'] + '/cbom'), first['cbom'])
         self.assertTrue(self.request('/audit/verify')['is_valid'])
