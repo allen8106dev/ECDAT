@@ -193,6 +193,11 @@ class APITests(unittest.TestCase):
         self.assertTrue(first['patches'][0]['review_required'])
         self.assertEqual([f['pattern'] for f in second['findings']], ['SHA256'])
         self.assertEqual(self.request('/scans/' + a['id'] + '/cbom'), first['cbom'])
+        view = self.request('/scans/' + a['id'] + '/result?include_cbom=false')
+        self.assertNotIn('cbom', view)
+        self.assertEqual(view['findings'], first['findings'])
+        self.assertEqual(self.request('/scans/' + a['id'] + '/report.json'), first)
+        self.assertEqual(self.request('/scans/' + a['id'] + '/cbom?download=true'), first['cbom'])
         self.assertTrue(self.request('/audit/verify')['is_valid'])
 
     def test_profile_drives_mosca_risk_and_cbom(self):
@@ -221,9 +226,26 @@ class APITests(unittest.TestCase):
             caught.exception.close()
 
     def test_demo_and_missing_scan(self):
-        report = self.finish(self.request('/scan', b''))
+        report = self.finish(self.request('/scan?scan_mode=large', b''))
+        self.assertEqual(report['limits']['mode'], 'large')
+        self.assertEqual(report['limits']['findings'], 200000)
         self.assertGreater(report['stats']['files_scanned'], 0)
         self.assertIn('AES', {f['pattern'] for f in report['findings']})
+        history = self.request('/history')
+        self.assertTrue(any(entry['id'] == report['id'] for entry in history['scans']))
+        with urlopen(self.base + '/scans/' + report['id'] + '/signed.zip', timeout=10) as response:
+            from signing import verify_bundle
+            bundle = response.read()
+        public = self.request('/signing-key')['public_key_pem'].encode()
+        self.assertTrue(verify_bundle(bundle, public))
+        with urlopen(self.base + '/scans/' + report['id'] + '/report.pdf', timeout=10) as response:
+            self.assertEqual(response.headers.get_content_type(), 'application/pdf')
+            self.assertIn(report['id'] + '.pdf', response.headers['Content-Disposition'])
+            self.assertTrue(response.read().startswith(b'%PDF-'))
+        with self.assertRaises(HTTPError) as missing_pdf:
+            urlopen(self.base + '/scans/' + '0' * 32 + '/report.pdf', timeout=10)
+        self.assertEqual(missing_pdf.exception.code, 404)
+        missing_pdf.exception.close()
         with self.assertRaises(HTTPError) as caught:
             self.request('/scans/' + '0' * 32)
         self.assertEqual(caught.exception.code, 404)

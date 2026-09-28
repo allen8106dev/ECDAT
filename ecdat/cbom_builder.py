@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from scanner import scan_directory
+from schema_validation import validate_cbom
+import hashlib
 
 
 def build_cbom(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -18,11 +20,14 @@ def build_cbom(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     components: List[Dict[str, Any]] = []
 
     for finding in findings:
+        asset_type = finding.get('asset_type', 'algorithm')
+        component_type = asset_type if asset_type in {'library', 'container'} else 'cryptographic-asset'
         component = {
-            "type": "cryptographic-asset",
+            "type": component_type,
+            "bom-ref": 'evidence-' + str(len(components)),
             "name": finding.get("pattern", "UNKNOWN"),
             "cryptoProperties": {
-                "assetType": finding.get("asset_type", "algorithm")
+                "assetType": 'related-crypto-material' if asset_type == 'key-material' else asset_type
             },
             "evidence": {
                 "occurrences": [
@@ -41,7 +46,18 @@ def build_cbom(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
                  for key in ("kind", "confidence", "severity", "offset", "evidence", "classification", "quantum_vulnerable", "riskAssessment", "cryptoAgilityScore", "metadata")
                  if finding.get(key) is not None]
         }
+        if component_type != 'cryptographic-asset':
+            component.pop('cryptoProperties')
         components.append(component)
+
+    file_refs = {}
+    relationships = {}
+    for finding, component in zip(findings, components):
+        path = finding.get('file', '')
+        ref = 'file-' + hashlib.sha256(path.encode()).hexdigest()
+        file_refs[path] = ref
+        relationships.setdefault(ref, []).append(component['bom-ref'])
+    components.extend({'type': 'file', 'name': path, 'bom-ref': ref} for path, ref in file_refs.items())
 
     cbom = {
         "bomFormat": "CycloneDX",
@@ -51,10 +67,11 @@ def build_cbom(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         "metadata": {
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         },
-        "components": components
+        "components": components,
+        "dependencies": [{"ref": ref, "dependsOn": links} for ref, links in relationships.items()]
     }
 
-    return cbom
+    return validate_cbom(cbom)
 
 
 if __name__ == "__main__":

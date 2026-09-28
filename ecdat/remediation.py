@@ -1,7 +1,9 @@
 """Conservative, review-only diffs for unambiguous legacy crypto calls."""
 import difflib
+import hashlib
 import re
 from pathlib import PurePosixPath
+from source_analysis import syntax_calls
 
 
 RULES = [
@@ -16,17 +18,35 @@ RULES = [
 ]
 
 
-def generate_patch(name, text):
+def generate_patch(name, text, analysis=None):
     suffix = PurePosixPath(name).suffix.lower()
-    patched = text
+    calls, coverage = analysis if analysis is not None else syntax_calls(name, text)
+    if not coverage.startswith('syntax:'):
+        return None
+    source = text.encode('utf-8')
+    replacements = {}
     changes = []
     for title, extensions, pattern, replacement in RULES:
         if suffix not in extensions:
             continue
-        patched, count = pattern.subn(replacement, patched)
+        count = 0
+        for call in calls:
+            for match in pattern.finditer(call['text']):
+                if not re.fullmatch(r'[\w.\s]*', call['text'][:match.start()]):
+                    continue
+                start = call['start'] + len(call['text'][:match.start()].encode('utf-8'))
+                end = call['start'] + len(call['text'][:match.end()].encode('utf-8'))
+                if (start, end) not in replacements:
+                    replacements[start, end] = match.expand(replacement).encode('utf-8')
+                    count += 1
         if count:
-            changes.append(f"{title}: {count} replacement{'s' if count != 1 else ''}")
+            changes.append(f'{title}: {count} replacements')
     if not changes:
         return None
+    for (start, end), replacement in sorted(replacements.items(), reverse=True):
+        source = source[:start] + replacement + source[end:]
+    patched = source.decode('utf-8')
     diff = list(difflib.unified_diff(text.splitlines(), patched.splitlines(), fromfile=f"a/{name}", tofile=f"b/{name}", lineterm=""))
-    return {"file": name, "changes": changes, "diff": diff, "review_required": True}
+    return {"file": name, "changes": changes, "diff": diff, "review_required": True,
+            'original_sha256': hashlib.sha256(text.encode()).hexdigest(),
+            'patched_sha256': hashlib.sha256(patched.encode()).hexdigest()}
