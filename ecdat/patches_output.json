@@ -1,0 +1,25 @@
+[
+  {
+    "file_path": "demo-data\\weak_hashing.py",
+    "file_name": "weak_hashing.py",
+    "original": "# weak_hashing.py: Demonstrates weak password hashing using MD5.\n# MD5 is obsolete and vulnerable to collision and pre-image attacks.\nimport hashlib\n\ndef hash_password(password: str) -> str:\n    # Insecure cryptographic hash: MD5 produces 128-bit digests\n    hasher = hashlib.md5()\n    hasher.update(password.encode(\"utf-8\"))\n    return hasher.hexdigest()\n\nif __name__ == \"__main__\":\n    raw_password = \"UserSecretPassword2026!\"\n    digest = hash_password(raw_password)\n    print(f\"[MD5] Hashed password: {digest}\")\n\n",
+    "patched": "# weak_hashing.py: Demonstrates weak password hashing using MD5.\n# MD5 is obsolete and vulnerable to collision and pre-image attacks.\nimport hashlib\n\ndef hash_password(password: str) -> str:\n    # Insecure cryptographic hash: MD5 produces 128-bit digests\n    hasher = hashlib.sha256()\n    hasher.update(password.encode(\"utf-8\"))\n    return hasher.hexdigest()\n\nif __name__ == \"__main__\":\n    raw_password = \"UserSecretPassword2026!\"\n    digest = hash_password(raw_password)\n    print(f\"[MD5] Hashed password: {digest}\")\n\n",
+    "changes": [
+      "Replaced 'hashlib\\.md5\\(' with 'hashlib.sha256(' (1 occurrence)"
+    ],
+    "diff": "--- a/weak_hashing.py\n+++ b/weak_hashing.py\n@@ -4,7 +4,7 @@\n \n def hash_password(password: str) -> str:\n     # Insecure cryptographic hash: MD5 produces 128-bit digests\n-    hasher = hashlib.md5()\n+    hasher = hashlib.sha256()\n     hasher.update(password.encode(\"utf-8\"))\n     return hasher.hexdigest()\n "
+  },
+  {
+    "file_path": "demo-data\\weak_symmetric.py",
+    "file_name": "weak_symmetric.py",
+    "original": "# weak_symmetric.py: Demonstrates obsolete symmetric encryption using DES.\n# DES has a short 56-bit key length and is vulnerable to brute-force attacks.\nfrom Crypto.Cipher import DES\nfrom Crypto.Util.Padding import pad\n\ndef encrypt_data(plaintext: bytes, key: bytes) -> bytes:\n    # Insecure legacy cipher: DES block size is 8 bytes\n    cipher = DES.new(key, DES.MODE_ECB)\n    return cipher.encrypt(pad(plaintext, DES.block_size))\n\nif __name__ == \"__main__\":\n    secret_key = b\"8bytekey\"  # DES requires an 8-byte key\n    data = b\"Sample legacy sensitive payload\"\n    ciphertext = encrypt_data(data, secret_key)\n    print(f\"[DES] Encrypted data (hex): {ciphertext.hex()}\")\n\n",
+    "patched": "# weak_symmetric.py: Demonstrates obsolete symmetric encryption using DES.\n# DES has a short 56-bit key length and is vulnerable to brute-force attacks.\nfrom Crypto.Cipher import AES\nfrom Crypto.Util.Padding import pad\n\ndef encrypt_data(plaintext: bytes, key: bytes) -> bytes:\n    # Insecure legacy cipher: DES block size is 8 bytes\n    cipher = AES.new(key, AES.MODE_GCM)\n    return cipher.encrypt(pad(plaintext, AES.block_size))\n\nif __name__ == \"__main__\":\n    secret_key = b\"8bytekey\"  # DES requires an 8-byte key\n    data = b\"Sample legacy sensitive payload\"\n    ciphertext = encrypt_data(data, secret_key)\n    print(f\"[DES] Encrypted data (hex): {ciphertext.hex()}\")\n\n",
+    "changes": [
+      "Replaced 'from Crypto\\.Cipher import DES' with 'from Crypto.Cipher import AES' (1 occurrence)",
+      "Replaced 'DES\\.new\\(' with 'AES.new(' (1 occurrence)",
+      "Replaced 'DES\\.MODE_ECB' with 'AES.MODE_GCM' (1 occurrence)",
+      "Replaced 'DES\\.block_size' with 'AES.block_size' (1 occurrence)"
+    ],
+    "diff": "--- a/weak_symmetric.py\n+++ b/weak_symmetric.py\n@@ -1,12 +1,12 @@\n # weak_symmetric.py: Demonstrates obsolete symmetric encryption using DES.\n # DES has a short 56-bit key length and is vulnerable to brute-force attacks.\n-from Crypto.Cipher import DES\n+from Crypto.Cipher import AES\n from Crypto.Util.Padding import pad\n \n def encrypt_data(plaintext: bytes, key: bytes) -> bytes:\n     # Insecure legacy cipher: DES block size is 8 bytes\n-    cipher = DES.new(key, DES.MODE_ECB)\n-    return cipher.encrypt(pad(plaintext, DES.block_size))\n+    cipher = AES.new(key, AES.MODE_GCM)\n+    return cipher.encrypt(pad(plaintext, AES.block_size))\n \n if __name__ == \"__main__\":\n     secret_key = b\"8bytekey\"  # DES requires an 8-byte key"
+  }
+]
